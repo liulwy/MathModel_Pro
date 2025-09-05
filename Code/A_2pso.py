@@ -4,12 +4,16 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import pandas as pd
 from tqdm import tqdm
+import multiprocessing as mp  # 添加多进程支持
+import signal
+import functools
+import time
+import threading
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ===== 常量定义 =====
-# 假目标和真目标位置
 fake_target = np.array([0.0, 0.0, 0.0])  # 假目标位置
 T_center = np.array([0.0, 200.0, 5.0])    # 真目标圆柱体中心
 T_radius = 7.0    # 圆柱体半径(m)
@@ -18,7 +22,6 @@ T_height = 10.0   # 圆柱体高度(m)
 # 导弹参数
 M0 = np.array([20000.0, 0.0, 2000.0])  # M1初始位置
 vM = 300.0  # 导弹速度(m/s)
-# 导弹方向向量 (指向假目标)
 uM = (fake_target - M0) / np.linalg.norm(fake_target - M0)
 
 # 无人机参数
@@ -34,59 +37,95 @@ DT = 0.01     # 时间步长(s)
 
 # ===== 圆柱体表面点生成 =====
 def generate_cylinder_points(num_points=100):
-    """生成圆柱体表面采样点"""
+    """生成圆柱体表面采样点（向量化实现）"""
     points = []
     z_min = T_center[2] - T_height/2
     z_max = T_center[2] + T_height/2
     
-    # 侧面点
-    theta = np.linspace(0, 2*np.pi, int(np.sqrt(num_points)), endpoint=False)
-    z = np.linspace(z_min, z_max, int(np.sqrt(num_points)))
-    for t in theta:
-        for zi in z:
-            points.append(np.array([
-                T_center[0] + T_radius * np.cos(t),
-                T_center[1] + T_radius * np.sin(t),
-                zi
-            ]))
+    # 侧面点（按面积比例分配点数）
+    area_side = 2 * np.pi * T_radius * T_height
+    area_top = np.pi * T_radius**2
+    total_area = area_side + area_top
+    num_side = int(num_points * area_side / total_area)
+    num_top = num_points - num_side
     
-    # 顶面点
-    r = np.linspace(0, T_radius, int(np.sqrt(num_points/2)))
-    theta = np.linspace(0, 2*np.pi, int(np.sqrt(num_points/2)), endpoint=False)
-    for ri in r:
-        for t in theta:
-            points.append(np.array([
-                T_center[0] + ri * np.cos(t),
-                T_center[1] + ri * np.sin(t),
-                z_max
-            ]))
+    # 侧面采样
+    num_theta = int(np.sqrt(num_side * T_radius / T_height))
+    num_z = max(1, num_side // num_theta)
+    
+    theta = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
+    z = np.linspace(z_min, z_max, num_z)
+    theta_grid, z_grid = np.meshgrid(theta, z)
+    
+    x = T_center[0] + T_radius * np.cos(theta_grid).flatten()
+    y = T_center[1] + T_radius * np.sin(theta_grid).flatten()
+    z = z_grid.flatten()
+    
+    side_points = np.column_stack((x, y, z))
+    points.extend(side_points)
+    
+    # 顶面采样
+    num_r = max(1, int(np.sqrt(num_top) / 2))
+    num_theta_top = max(1, num_top // num_r)
+    
+    r = np.linspace(0, T_radius, num_r)
+    theta_top = np.linspace(0, 2*np.pi, num_theta_top, endpoint=False)
+    r_grid, theta_top_grid = np.meshgrid(r, theta_top)
+    
+    x_top = T_center[0] + r_grid.flatten() * np.cos(theta_top_grid.flatten())
+    y_top = T_center[1] + r_grid.flatten() * np.sin(theta_top_grid.flatten())
+    z_top = np.full_like(x_top, z_max)
+    
+    top_points = np.column_stack((x_top, y_top, z_top))
+    points.extend(top_points)
     
     return points[:num_points]
 
-cylinder_points = generate_cylinder_points(100)
+cylinder_points = np.array(generate_cylinder_points(150))  # 增加采样点以提高精度
 
-# ===== 几何计算函数 =====
-def is_line_of_sight_blocked(cloud_center, missile_pos, target_point):
-    """检查烟幕是否阻挡了导弹到目标点的视线"""
-    # 导弹到目标的向量
-    missile_to_target = target_point - missile_pos
-    # 导弹到云团中心的向量
-    missile_to_cloud = cloud_center - missile_pos
+# ===== 向量化几何计算函数 =====
+def point_to_line_segment_distance_sq_batch(point, line_start, line_end):
+    """计算点到线段的最短距离平方（修复版）
+    point: 云团中心点 (3,)
+    line_start: 导弹位置 (3,)
+    line_end: 目标点数组 (N,3)
+    """
+    # 计算线向量
+    line_vec = line_end - line_start  # (N,3)
     
-    # 计算投影比例
-    t = np.dot(missile_to_cloud, missile_to_target) / np.dot(missile_to_target, missile_to_target)
-    t = max(0.0, min(1.0, t))  # 钳制到[0,1]区间
+    # 计算从线段起点到目标点的向量
+    point_vec = point - line_start  # (3,)
     
-    # 计算视线上的最近点
-    closest_point = missile_pos + t * missile_to_target
+    # 计算投影
+    line_len_sq = np.sum(line_vec**2, axis=1)  # (N,)
     
-    # 检查云团中心到最近点的距离
-    distance = np.linalg.norm(cloud_center - closest_point)
-    return distance <= r_cloud
+    # 处理极短线段
+    valid = line_len_sq > 1e-12
+    
+    # 初始化结果数组
+    result = np.zeros_like(line_len_sq)
+    
+    # 处理无效线段(接近点)
+    if not np.all(valid):
+        invalid_mask = ~valid
+        result[invalid_mask] = np.sum((point - line_start)**2)
+    
+    if np.any(valid):
+        # 计算点在线段上的投影比例
+        proj = np.sum(point_vec * line_vec[valid], axis=1) / line_len_sq[valid]  # (N_valid,)
+        proj = np.clip(proj, 0.0, 1.0)
+        
+        # 计算线段上的最近点
+        closest = line_start + proj.reshape(-1, 1) * line_vec[valid]  # (N_valid,3)
+        
+        # 计算最近点到目标点的距离平方
+        result[valid] = np.sum((closest - point)**2, axis=1)  # (N_valid,)
+    
+    return result
 
-# ===== 遮蔽时长计算 =====
-def calculate_cover_time(t_rel, dly, vF, theta):
-    """计算遮蔽时长"""
+# ===== 优化版遮蔽时长计算 =====
+def calculate_cover_time_fast(t_rel, dly, vF, theta):
+    """优化版遮蔽时长计算，使用自适应采样"""
     t_det = t_rel + dly
     t_start = t_det
     t_end = t_det + t_window
@@ -94,64 +133,117 @@ def calculate_cover_time(t_rel, dly, vF, theta):
     # 无人机方向向量
     uF = np.array([np.cos(theta), np.sin(theta), 0])
     
-    # 无人机位置函数 (等高度平飞)
-    def F(t):
-        return F0 + vF * t * uF
+    # 预计算起爆点位置
+    drop_pos = F0 + vF * t_rel * uF
+    drop_vel = vF * uF
+    C_det = drop_pos + drop_vel * dly + np.array([0, 0, -0.5*g*dly**2])
     
-    # 干扰弹位置函数 (投放后只受重力影响)
-    def B(t):
-        if t < t_rel:
-            return F(t)
-        dt = t - t_rel
-        # 投放点位置和速度
-        drop_pos = F(t_rel)
-        drop_vel = vF * uF  # 投放瞬间只有水平速度
-        # 干扰弹位置 (水平匀速，垂直自由落体)
-        return drop_pos + drop_vel * dt + np.array([0, 0, -0.5*g*dt**2])
+    # 粗采样
+    dt_coarse = 0.1  # 粗采样步长
+    ts_coarse = np.arange(t_start, t_end, dt_coarse)
     
-    # 云团中心位置函数
-    C_det = B(t_det)  # 起爆点位置
-    def C(t):
-        if t < t_det:
-            return np.array([np.nan, np.nan, np.nan])
-        dt = t - t_det
-        return C_det + np.array([0, 0, -v_sink*dt])
-    
-    # 导弹位置函数
-    def M(t):
-        return M0 + vM * t * uM
-    
-    # 检查特定时间点是否被遮蔽
-    def is_covered(t):
-        cloud_center = C(t)
-        if any(np.isnan(cloud_center)):
-            return False
+    # 向量化视线判定
+    def is_covered_batch(t_array):
+        covered = np.zeros(len(t_array), dtype=bool)
         
-        missile_pos = M(t)
-        
-        # 检查圆柱体表面所有点是否至少有一个视线被阻挡
-        for point in cylinder_points:
-            if not is_line_of_sight_blocked(cloud_center, missile_pos, point):
-                return False
-        return True
+        for i, t in enumerate(t_array):
+            # 导弹位置
+            missile_pos = M0 + vM * t * uM
+            
+            # 云团中心位置
+            dt = t - t_det
+            if dt < 0:
+                continue
+            cloud_center = C_det + np.array([0, 0, -v_sink*dt])
+            
+            # 计算云团中心到所有视线的距离
+            dist_sq = point_to_line_segment_distance_sq_batch(cloud_center, missile_pos, cylinder_points)
+            
+            # 如果所有视线都在云团内，则被遮蔽
+            if np.all(dist_sq <= r_cloud**2):
+                covered[i] = True
+                
+        return covered
     
-    # 时间采样
-    ts = np.arange(t_start, t_end, DT)
-    covered = np.array([is_covered(t) for t in ts])
-    return np.sum(covered) * DT
+    # 粗采样评估
+    covered_coarse = is_covered_batch(ts_coarse)
+    
+    # 找到遮蔽区间
+    total_time = 0.0
+    if np.any(covered_coarse):
+        # 识别状态变化的位置
+        changes = np.diff(covered_coarse.astype(int))
+        start_idxs = np.where(changes == 1)[0]
+        end_idxs = np.where(changes == -1)[0]
+        
+        # 处理边界情况
+        if covered_coarse[0]:
+            start_idxs = np.insert(start_idxs, 0, -1)
+        if covered_coarse[-1]:
+            end_idxs = np.append(end_idxs, len(covered_coarse)-1)
+            
+        # 细化每个区间边界
+        for start_idx, end_idx in zip(start_idxs, end_idxs):
+            t_a = ts_coarse[start_idx + 1] if start_idx >= 0 else ts_coarse[0]
+            t_b = ts_coarse[end_idx + 1] if end_idx < len(ts_coarse) - 1 else ts_coarse[-1]
+            
+            # 在细化区间使用更精确的步长
+            ts_fine = np.arange(t_a, t_b, DT)
+            if len(ts_fine) == 0:
+                continue
+                
+            covered_fine = is_covered_batch(ts_fine)
+            
+            # 计算这个区间的遮蔽时长
+            interval_time = np.sum(covered_fine) * DT
+            total_time += interval_time
+    
+    return total_time
 
-# ===== 改进的粒子群优化算法 =====
-class EnhancedPSO:
+def _eval_particle(particle):
+    """粒子适应度评估函数(可并行)"""
+    theta, vF, t_rel, dly = particle
+    return calculate_cover_time_fast(t_rel, dly, vF, theta)
+
+# ===== 加速版PSO优化器 =====
+class TimeoutError(Exception):
+    pass
+
+class Timeout:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.timer = None
+        self.timeout_occurred = False
+    
+    def timeout_function(self):
+        self.timeout_occurred = True
+        thread_id = threading.current_thread().ident
+        # 抛出异常会导致问题，我们只标记状态
+        print(f"  [警告] 操作已超过{self.seconds}秒，标记为超时")
+    
+    def __enter__(self):
+        self.timer = threading.Timer(self.seconds, self.timeout_function)
+        self.timer.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.timer:
+            self.timer.cancel()
+
+class AcceleratedPSO:
     def __init__(self, n_particles=50, max_iter=200, w_init=0.9, w_end=0.4, 
-                 c1_init=2.5, c1_end=0.5, c2_init=0.5, c2_end=2.5):
+                 c1_init=2.5, c1_end=0.5, c2_init=0.5, c2_end=2.5,
+                 n_jobs=-1, local_search_freq=10):
         """
-        改进的PSO算法
+        加速版PSO算法
         参数:
             n_particles: 粒子数量
             max_iter: 最大迭代次数
             w_init/w_end: 惯性权重的初始/结束值
             c1_init/c1_end: 认知系数的初始/结束值
             c2_init/c2_end: 社会系数的初始/结束值
+            n_jobs: 并行进程数(-1表示使用所有可用CPU)
+            local_search_freq: 局部搜索频率
         """
         self.n_particles = n_particles
         self.max_iter = max_iter
@@ -164,7 +256,11 @@ class EnhancedPSO:
         self.c2_init = c2_init
         self.c2_end = c2_end
         
-        # 搜索空间边界 (与 a2.py 保持一致)
+        # 并行设置
+        self.n_jobs = n_jobs if n_jobs > 0 else max(1, mp.cpu_count()-1)
+        self.local_search_freq = local_search_freq
+        
+        # 搜索空间边界
         self.bounds = np.array([
             [-np.pi,  np.pi],          # theta (航向角)
             [min_speed, max_speed],    # vF (速度)
@@ -172,33 +268,53 @@ class EnhancedPSO:
             [0.0,    20.0]             # dly (起爆延迟)
         ], dtype=float)
         
-        # 初始化粒子
-        self.particles = np.random.rand(n_particles, 4)
-        for i in range(4):
-            self.particles[:, i] = self.bounds[i, 0] + self.particles[:, i] * (self.bounds[i, 1] - self.bounds[i, 0])
+        # 智能初始化
+        self.particles = self._smart_initialize(n_particles)
         
         # 初始化速度
-        self.velocities = np.random.randn(n_particles, 4) * 0.1
+        span = self.bounds[:,1] - self.bounds[:,0]
+        self.velocities = np.random.randn(n_particles, 4) * 0.1 * span
         
-        # 初始化个体最优
+        # 初始化个体最优和全局最优
         self.pbest_pos = self.particles.copy()
         self.pbest_val = np.array([-np.inf] * n_particles)
-        
-        # 初始化全局最优
         self.gbest_pos = None
         self.gbest_val = -np.inf
+        self.elite_pos = None
+        self.elite_val = -np.inf
         
         # 记录历史最优值
         self.history = []
-        
-        # 精英保留
-        self.elite_pos = None
-        self.elite_val = -np.inf
+        self.iter_nums = []
     
-    def evaluate(self, particle):
-        """评估粒子的适应度"""
-        theta, vF, t_rel, dly = particle
-        return calculate_cover_time(t_rel, dly, vF, theta)
+    def _smart_initialize(self, n_particles):
+        """智能初始化粒子位置"""
+        particles = np.zeros((n_particles, 4))
+        
+        # 20% 完全随机初始化
+        num_random = int(n_particles * 0.2)
+        for i in range(num_random):
+            for j in range(4):
+                particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
+        
+        # 30% 使用预设好的航向角分布
+        num_preset = int(n_particles * 0.3)
+        if num_preset > 0:
+            preset_angles = np.array([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, 
+                                     -np.pi/4, -np.pi/2, -3*np.pi/4])
+            for i in range(num_random, num_random + num_preset):
+                angle_idx = i % len(preset_angles)
+                particles[i, 0] = preset_angles[angle_idx] + np.random.normal(0, 0.1)
+                # 随机其他参数
+                for j in range(1, 4):
+                    particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
+        
+        # 其余粒子随机初始化
+        for i in range(num_random + num_preset, n_particles):
+            for j in range(4):
+                particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
+        
+        return particles
     
     def get_dynamic_params(self, iter):
         """获取动态参数"""
@@ -208,27 +324,131 @@ class EnhancedPSO:
         c2 = self.c2_init + (self.c2_end - self.c2_init) * progress
         return w, c1, c2
     
+    # 替换原来的局部搜索函数
+    def local_search(self):
+        """在全局最优附近进行局部搜索（Windows兼容版）"""
+        if self.gbest_val <= 0:
+            return
+        
+        print("  开始局部搜索...")
+        
+        # 减少局部搜索点数
+        n_local = 10
+        best_val = self.gbest_val
+        best_pos = self.gbest_pos.copy()
+        
+        # 局部搜索范围
+        prog = len(self.history) / self.max_iter
+        scale = 0.2 * (1 - prog) + 0.02
+        
+        # 准备搜索点
+        search_points = []
+        
+        # 对每个维度单独扰动
+        for dim in range(4):
+            local_range = self.bounds[dim, 1] - self.bounds[dim, 0]
+            delta = local_range * scale * 0.1
+            
+            # 正向扰动
+            point_pos = best_pos.copy()
+            point_pos[dim] += delta
+            point_pos[dim] = min(self.bounds[dim, 1], point_pos[dim])
+            search_points.append(point_pos)
+            
+            # 负向扰动
+            point_neg = best_pos.copy()
+            point_neg[dim] -= delta
+            point_neg[dim] = max(self.bounds[dim, 0], point_neg[dim])
+            search_points.append(point_neg)
+        
+        # 再增加几个随机点
+        for _ in range(n_local - 8):
+            point = best_pos + np.random.normal(0, 1, 4) * scale * 0.05
+            # 边界处理
+            for j in range(4):
+                point[j] = max(self.bounds[j, 0], min(self.bounds[j, 1], point[j]))
+            search_points.append(point)
+        
+        search_points = np.array(search_points)
+        
+        try:
+            with Timeout(30):
+                # 使用临时进程池避免资源泄漏
+                with mp.Pool(processes=min(self.n_jobs, len(search_points))) as pool:
+                    local_fitness = np.array(pool.map(_eval_particle, search_points))
+                
+                # 更新全局最优
+                best_idx = np.argmax(local_fitness)
+                if local_fitness[best_idx] > best_val:
+                    best_val = local_fitness[best_idx]
+                    best_pos = search_points[best_idx].copy()
+                    print(f"  [局部搜索] 发现更优解: {best_val:.6f}s")
+                    
+                    # 更新全局最优
+                    if best_val > self.gbest_val:
+                        self.gbest_val = best_val
+                        self.gbest_pos = best_pos.copy()
+        except Exception as e:
+            print(f"  [错误] 局部搜索异常: {str(e)}")
+    
     def optimize(self):
         """执行优化"""
-        print(f"开始改进PSO优化，粒子数: {self.n_particles}, 最大迭代: {self.max_iter}")
+        print(f"开始并行PSO优化，使用{self.n_jobs}个CPU核心...")
+        print(f"粒子数: {self.n_particles}, 最大迭代: {self.max_iter}")
         
-        for iter in tqdm(range(self.max_iter), desc="PSO优化进度"):
+        # 并行评估初始种群
+        with mp.Pool(processes=self.n_jobs) as pool:
+            self.pbest_val = np.array(pool.map(_eval_particle, self.particles))
+        
+        self.pbest_pos = self.particles.copy()
+        best_idx = np.argmax(self.pbest_val)
+        self.gbest_pos = self.pbest_pos[best_idx].copy()
+        self.gbest_val = self.pbest_val[best_idx]
+        
+        # 记录初始最优
+        self.history.append(self.gbest_val)
+        self.iter_nums.append(0)
+        print(f"[PSO 0/{self.max_iter}] gbest={self.gbest_val:.6f}s")
+        
+        # 主迭代循环
+        for iter in range(1, self.max_iter + 1):
             # 获取动态参数
             w, c1, c2 = self.get_dynamic_params(iter)
             
-            # 评估所有粒子
-            for i in range(self.n_particles):
-                fitness = self.evaluate(self.particles[i])
-                
-                # 更新个体最优
-                if fitness > self.pbest_val[i]:
-                    self.pbest_val[i] = fitness
-                    self.pbest_pos[i] = self.particles[i].copy()
-                
-                # 更新全局最优
-                if fitness > self.gbest_val:
-                    self.gbest_val = fitness
-                    self.gbest_pos = self.particles[i].copy()
+            # 更新速度和位置
+            r1, r2 = np.random.rand(self.n_particles, 4), np.random.rand(self.n_particles, 4)
+            cognitive = c1 * r1 * (self.pbest_pos - self.particles)
+            social = c2 * r2 * (self.gbest_pos - self.particles)
+            self.velocities = w * self.velocities + cognitive + social
+            
+            # 速度限制
+            span = self.bounds[:,1] - self.bounds[:,0]
+            self.velocities = np.clip(self.velocities, -0.2*span, 0.2*span)
+            
+            # 更新位置
+            self.particles += self.velocities
+            
+            # 边界处理
+            for j in range(4):
+                self.particles[:, j] = np.clip(self.particles[:, j], 
+                                             self.bounds[j, 0], 
+                                             self.bounds[j, 1])
+            
+            # 并行评估
+            with mp.Pool(processes=self.n_jobs) as pool:
+                fitness = np.array(pool.map(_eval_particle, self.particles))
+            
+            # 更新个体最优
+            improved = fitness > self.pbest_val
+            self.pbest_pos[improved] = self.particles[improved]
+            self.pbest_val[improved] = fitness[improved]
+            
+            # 更新全局最优
+            best_idx = np.argmax(self.pbest_val)
+            iter_best = np.max(fitness)
+            if self.pbest_val[best_idx] > self.gbest_val:
+                self.gbest_val = self.pbest_val[best_idx]
+                self.gbest_pos = self.pbest_pos[best_idx].copy()
             
             # 精英保留
             if self.gbest_val > self.elite_val:
@@ -237,110 +457,104 @@ class EnhancedPSO:
             
             # 记录历史最优值
             self.history.append(self.gbest_val)
+            self.iter_nums.append(iter)
             
-            # 更新速度和位置
-            for i in range(self.n_particles):
-                # 计算新速度
-                r1, r2 = np.random.rand(2)
-                cognitive = c1 * r1 * (self.pbest_pos[i] - self.particles[i])
-                social = c2 * r2 * (self.gbest_pos - self.particles[i])
-                self.velocities[i] = w * self.velocities[i] + cognitive + social
-                
-                # 更新位置
-                self.particles[i] += self.velocities[i]
-                
-                # 边界检查
-                for j in range(4):
-                    if self.particles[i, j] < self.bounds[j, 0]:
-                        self.particles[i, j] = self.bounds[j, 0]
-                        self.velocities[i, j] *= -0.5
-                    elif self.particles[i, j] > self.bounds[j, 1]:
-                        self.particles[i, j] = self.bounds[j, 1]
-                        self.velocities[i, j] *= -0.5
+            print(f"[PSO {iter}/{self.max_iter}] iter_best={iter_best:.6f}s, gbest={self.gbest_val:.6f}s")
             
-            # 每20次迭代进行一次局部搜索
-            if (iter + 1) % 20 == 0:
-                self.local_search()
+            # 每10次迭代进行局部搜索
+            if iter % self.local_search_freq == 0:
+                try:
+                    self.local_search()
+                except Exception as e:
+                    print(f"  [警告] 局部搜索异常: {str(e)}")
         
-        # 最终使用精英解
+        # 替换最终局部搜索调用
+        print("执行最终精细局部搜索...")
+        try:
+            self.local_search()
+        except Exception as e:
+            print(f"[警告] 最终局部搜索失败: {str(e)}, 使用当前最优解")
+        
+        # 使用精英解
         if self.elite_val > self.gbest_val:
             self.gbest_val = self.elite_val
             self.gbest_pos = self.elite_pos.copy()
         
-        print("\n优化完成!")
-        print(f"最优航向角: {np.degrees(self.gbest_pos[0]):.4f}°")
-        print(f"最优速度: {self.gbest_pos[1]:.4f} m/s")
-        print(f"最优投放时刻: {self.gbest_pos[2]:.4f} s")
-        print(f"最优起爆延迟: {self.gbest_pos[3]:.4f} s")
-        print(f"最大遮蔽时长: {self.gbest_val:.6f} s")
+        # 最后绘制完整收敛曲线
+        self.plot_convergence()
         
         return self.gbest_pos, self.gbest_val
     
-    def local_search(self):
-        """在全局最优附近进行局部搜索"""
-        if self.gbest_val <= 0:
-            return
-        
-        # 局部搜索范围
-        local_range = np.array([0.05, 2.0, 0.1, 0.1])
-        
-        # 生成局部搜索点
-        n_local = 20
-        local_points = np.random.randn(n_local, 4)
-        for i in range(4):
-            local_points[:, i] = self.gbest_pos[i] + local_points[:, i] * local_range[i]
-            local_points[:, i] = np.clip(local_points[:, i], self.bounds[i, 0], self.bounds[i, 1])
-        
-        # 评估局部点
-        for point in local_points:
-            fitness = self.evaluate(point)
-            if fitness > self.gbest_val:
-                self.gbest_val = fitness
-                self.gbest_pos = point.copy()
-    
     def plot_convergence(self):
-        """绘制收敛曲线"""
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.history, 'b-', linewidth=2)
-        plt.xlabel('迭代次数', fontsize=12)
-        plt.ylabel('遮蔽时长 (s)', fontsize=12)
-        plt.title('改进PSO优化收敛曲线', fontsize=14)
-        plt.grid(True)
+        """绘制完整收敛曲线"""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.set_title(f"A2-PSO收敛曲线", fontsize=14)
+        ax.set_xlabel("迭代次数", fontsize=12)
+        ax.set_ylabel("遮蔽时长 (s)", fontsize=12)
+        ax.grid(True, linestyle=":", alpha=0.7)
+        
+        # 绘制收敛曲线
+        ax.plot(self.iter_nums, self.history, "-o", ms=4, color="#FF7F0E", 
+                linewidth=1.8, label="全局最优值")
+        
+        # 在最终点标记
+        ax.scatter([self.iter_nums[-1]], [self.history[-1]], s=100, 
+                   marker="*", color="#C44E52", label=f"最终值: {self.history[-1]:.4f}s")
+        
+        # 添加改进点标注
+        improvements = np.diff(self.history) > 0
+        for i in range(1, len(self.iter_nums)):
+            if improvements[i-1] and i % max(1, len(self.iter_nums)//10) == 0:
+                ax.annotate(f"{self.history[i]:.2f}", 
+                           (self.iter_nums[i], self.history[i]),
+                           textcoords="offset points", 
+                           xytext=(0,10), 
+                           ha='center',
+                           fontsize=9,
+                           arrowprops=dict(arrowstyle='->', color='gray'))
+        
+        ax.legend(loc="lower right")
         plt.tight_layout()
+        plt.savefig("pso_q2_convergence_plot.png", dpi=300, bbox_inches='tight')
         plt.show()
-
-# ===== 多次独立运行 =====
-def multi_run_PSO(n_runs=3):
-    """多次独立运行PSO以避免局部最优"""
-    best_solutions = []
-    
-    for run in range(n_runs):
-        print(f"\n=== 第 {run+1}/{n_runs} 次独立运行 ===")
-        pso = EnhancedPSO(n_particles=50, max_iter=200)
-        best_params, best_score = pso.optimize()
-        best_solutions.append((best_params, best_score))
-        pso.plot_convergence()
-    
-    # 选择多次运行中的最优解
-    best_idx = np.argmax([s[1] for s in best_solutions])
-    return best_solutions[best_idx]
 
 # ===== 主函数 =====
 def main():
-    # 运行改进的PSO算法
-    best_params, best_score = multi_run_PSO()
+    t0 = time.time()
     
-    # 计算关键点位置
+    # 使用加速版PSO
+    pso = AcceleratedPSO(
+        n_particles=60,              # 粒子数量
+        max_iter=200,                # 迭代次数
+        w_init=0.9, w_end=0.4,       # 惯性权重
+        c1_init=2.5, c1_end=0.5,     # 认知系数
+        c2_init=0.5, c2_end=2.5,     # 社会系数
+        n_jobs=-1,                   # 使用所有可用核心
+        local_search_freq=10         # 每10次迭代进行局部搜索
+    )
+    
+    best_params, best_score = pso.optimize()
+    elapsed = time.time() - t0
+    
+    # 解析最佳参数
     theta_opt, vF_opt, t_rel_opt, dly_opt = best_params
     uF = np.array([np.cos(theta_opt), np.sin(theta_opt), 0])
     
-    # 投放点 (无人机在投放时刻的位置)
+    # 投放点
     drop_point = F0 + vF_opt * t_rel_opt * uF
     
-    # 起爆点 (干扰弹在起爆时刻的位置)
-    # 投放后只受重力影响，水平速度保持不变
+    # 起爆点
     drop_vel = vF_opt * uF
     bomb_pos = drop_point + drop_vel * dly_opt + np.array([0, 0, -0.5 * g * dly_opt**2])
+    
+    print(f"\n===== 最优结果 =====")
+    print(f"航向角θ: {np.degrees(theta_opt):.4f}°")
+    print(f"速度v_F: {vF_opt:.4f} m/s")
+    print(f"投放时刻: {t_rel_opt:.4f} s")
+    print(f"起爆延迟: {dly_opt:.4f} s")
+    print(f"起爆时刻: {(t_rel_opt + dly_opt):.4f} s")
+    print(f"总遮蔽时长: {best_score:.6f} s")
+    print(f"优化用时: {elapsed:.2f} s")
     
     # 可视化最优解
     visualize_solution(theta_opt, vF_opt, t_rel_opt, dly_opt, drop_point, bomb_pos)
@@ -350,106 +564,99 @@ def main():
 
 # ===== 可视化函数 =====
 def visualize_solution(theta, vF, t_rel, dly, drop_point, bomb_pos):
-    """可视化最优解下的轨迹和遮蔽效果"""
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # 无人机方向向量
+    """可视化最优解下的遮蔽效果（简化版）"""
+    # 计算关键参数
+    t_det = t_rel + dly
+    t_end = t_det + t_window
     uF = np.array([np.cos(theta), np.sin(theta), 0])
     
-    # 无人机位置函数 (等高度平飞)
-    def F(t):
-        return F0 + vF * t * uF
+    # 创建遮蔽状态图
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
     
-    # 干扰弹位置函数 (投放后只受重力影响)
-    def B(t):
-        if t < t_rel:
-            return F(t)
-        dt = t - t_rel
-        drop_vel = vF * uF
-        return drop_point + drop_vel * dt + np.array([0, 0, -0.5*g*dt**2])
+    # 准备时间轴数据
+    ts = np.linspace(t_det - 1, t_end + 1, 300)  # 精细采样
     
-    # 云团中心位置函数
-    t_det = t_rel + dly
-    C_det = B(t_det)
-    def C(t):
+    # 计算每个时刻的遮蔽状态
+    covered_status = []
+    for t in ts:
+        # 导弹位置
+        missile_pos = M0 + vM * t * uM
+        
+        # 云团中心位置（仅在t≥t_det时存在）
         if t < t_det:
-            return np.array([np.nan, np.nan, np.nan])
+            covered_status.append(0.0)
+            continue
+            
         dt = t - t_det
-        return C_det + np.array([0, 0, -v_sink*dt])
+        if dt > t_window:
+            covered_status.append(0.0)
+            continue
+            
+        cloud_center = bomb_pos + np.array([0, 0, -v_sink * dt])
+        
+        # 计算是否遮蔽
+        dist_sq = point_to_line_segment_distance_sq_batch(cloud_center, missile_pos, cylinder_points)
+        covered_status.append(1.0 if np.all(dist_sq <= r_cloud**2) else 0.0)
     
-    # 导弹位置函数
-    def M(t):
-        return M0 + vM * t * uM
+    covered_status = np.array(covered_status)
     
-    # 计算轨迹
-    t_max = max(30, t_det + t_window)
-    ts = np.linspace(0, t_max, 100)
+    # 寻找遮蔽区间
+    intervals = []
+    if covered_status.any():
+        # 找到状态变化点
+        changes = np.diff(covered_status)
+        start_idxs = np.where(changes > 0.5)[0]
+        end_idxs = np.where(changes < -0.5)[0]
+        
+        # 处理边界情况
+        if covered_status[0] > 0.5:
+            start_idxs = np.insert(start_idxs, 0, -1)
+        if covered_status[-1] > 0.5:
+            end_idxs = np.append(end_idxs, len(covered_status)-1)
+        
+        # 配对并获取实际时间
+        for start_i, end_i in zip(start_idxs, end_idxs):
+            start_t = ts[start_i+1] if start_i >= 0 else ts[0]
+            end_t = ts[end_i] if end_i < len(ts) else ts[-1]
+            intervals.append((start_t, end_t))
     
-    missile_traj = np.array([M(t) for t in ts])
-    drone_traj = np.array([F(t) for t in ts])
-    bomb_traj = np.array([B(t) for t in ts if t >= t_rel])
-    cloud_traj = np.array([C(t) for t in ts if t >= t_det])
+    # 绘制遮蔽状态函数
+    ax.plot(ts, covered_status, color="#1f77b4", linewidth=2, label="遮蔽状态")
     
-    # 绘制轨迹
-    ax.plot(missile_traj[:,0], missile_traj[:,1], missile_traj[:,2], 
-            'r-', linewidth=1.5, label='导弹轨迹')
-    ax.plot(drone_traj[:,0], drone_traj[:,1], drone_traj[:,2], 
-            'b-', linewidth=1.5, label='无人机轨迹')
-    ax.plot(bomb_traj[:,0], bomb_traj[:,1], bomb_traj[:,2], 
-            'g-', linewidth=1.5, label='干扰弹轨迹')
-    ax.plot(cloud_traj[:,0], cloud_traj[:,1], cloud_traj[:,2], 
-            'm-', linewidth=1.5, label='云团中心轨迹')
+    # 填充遮蔽区间
+    ax.fill_between(ts, 0, 1, where=covered_status > 0.5,
+                   alpha=0.3, color="#add8e6", label="遮蔽区间")
     
-    # 标记关键点
-    ax.scatter(*M0, c='red', s=60, label='导弹初始位置')
-    ax.scatter(*F0, c='blue', s=60, label='无人机初始位置')
-    ax.scatter(*drop_point, c='green', s=60, label='投放点')
-    ax.scatter(*bomb_pos, c='magenta', s=100, marker='*', label='起爆点')
+    # 标记关键时间点
+    ax.axvline(t_rel, linestyle="--", color="green", alpha=0.7, label="投放时刻")
+    ax.axvline(t_det, linestyle="--", color="red", alpha=0.7, label="起爆时刻")
+    ax.axvline(t_end, linestyle="--", color="purple", alpha=0.7, label="有效期结束")
     
-    # 绘制假目标和真目标
-    ax.scatter(*fake_target, c='orange', s=100, marker='s', label='假目标')
+    # 设置轴标签和标题
+    ax.set_xlabel("时间 t (秒)", fontsize=12)
+    ax.set_ylabel("遮蔽状态 (1=遮蔽, 0=未遮蔽)", fontsize=12)
+    ax.set_title("问题二最优解的遮蔽状态函数", fontsize=14)
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, linestyle=":")
     
-    # 绘制真目标圆柱体
-    z_min = T_center[2] - T_height/2
-    z_max = T_center[2] + T_height/2
+    # 计算总遮蔽时长
+    total_covered = sum(end-start for start, end in intervals)
     
-    # 绘制侧面
-    theta_vals = np.linspace(0, 2 * np.pi, 50)
-    z_vals = np.linspace(z_min, z_max, 10)
-    theta_grid, z_grid = np.meshgrid(theta_vals, z_vals)
-    x = T_center[0] + T_radius * np.cos(theta_grid)
-    y = T_center[1] + T_radius * np.sin(theta_grid)
-    ax.plot_surface(x, y, z_grid, color='gray', alpha=0.3, label='真目标')
+    # 在图中添加关键参数信息
+    info_text = (
+        f"航向角: {np.degrees(theta):.2f}°\n"
+        f"飞行速度: {vF:.2f} m/s\n"
+        f"投放时刻: {t_rel:.2f} s\n"
+        f"起爆延迟: {dly:.2f} s\n"
+        f"总遮蔽时长: {total_covered:.3f} s"
+    )
+    ax.text(0.02, 0.02, info_text, transform=ax.transAxes, fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
-    # 绘制顶面
-    r_vals = np.linspace(0, T_radius, 10)
-    theta_top = np.linspace(0, 2 * np.pi, 50)
-    r_grid, theta_top_grid = np.meshgrid(r_vals, theta_top)
-    x_top = T_center[0] + r_grid * np.cos(theta_top_grid)
-    y_top = T_center[1] + r_grid * np.sin(theta_top_grid)
-    z_top = np.full_like(x_top, z_max)
-    ax.plot_surface(x_top, y_top, z_top, color='gray', alpha=0.3)
-    
-    # 添加文字标注
-    ax.text(T_center[0], T_center[1], T_center[2], "真目标中心", fontsize=12, color='black', zorder=10)
-    
-    # 设置图形属性
-    ax.set_xlabel('X (m)', fontsize=12)
-    ax.set_ylabel('Y (m)', fontsize=12)
-    ax.set_zlabel('Z (m)', fontsize=12)
-    ax.set_title('最优投放策略几何示意图', fontsize=14)
-    ax.legend(fontsize=10)
-    
-    # 调整视角
-    ax.view_init(elev=25, azim=-45)
-    
-    # 设置坐标轴范围
-    ax.set_xlim([-1000, 21000])
-    ax.set_ylim([-1000, 2100])
-    ax.set_zlim([-100, 2500])
-    
+    ax.legend(loc="upper right", fontsize=10)
     plt.tight_layout()
+    plt.savefig("problem2_coverage.png", dpi=300, bbox_inches='tight')
     plt.show()
 
 def save_results(params, score, drop_point, bomb_pos):

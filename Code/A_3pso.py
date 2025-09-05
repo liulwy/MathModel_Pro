@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import time
 import multiprocessing as mp  # 添加多进程支持
 from functools import partial
+import threading
 
 # 字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -70,6 +71,7 @@ def generate_cylinder_points(num_points=150):
     return pts
 
 T_arr = generate_cylinder_points(150)  # (N,3)，可按需加密
+cylinder_points = T_arr
 
 # ===== 运动学 =====
 def missile_position(t: float) -> np.ndarray:
@@ -103,6 +105,53 @@ _thr2 = r_cloud**2 + 1e-12
 def angle_wrap(theta):
     """将角度规范化到 [-π, π] 范围内"""
     return (theta + np.pi) % (2 * np.pi) - np.pi
+
+
+def point_to_line_segment_distance_sq_batch(point, line_start, line_end):
+    """计算点到线段的最短距离平方
+    point: 云团中心点 (3,)
+    line_start: 导弹位置 (3,)
+    line_end: 目标点数组 (N,3)
+    """
+    # 计算线向量
+    line_vec = line_end - line_start  # (N,3)
+
+    # 计算从线段起点到目标点的向量
+    point_vec = point - line_start  # (3,)
+
+    # 计算投影
+    line_len_sq = np.sum(line_vec ** 2, axis=1)  # (N,)
+
+    # 处理极短线段
+    valid = line_len_sq > 1e-12
+
+    # 初始化结果数组
+    result = np.zeros_like(line_len_sq)
+
+    # 处理无效线段(接近点)
+    if not np.all(valid):
+        invalid_mask = ~valid
+        result[invalid_mask] = np.sum((point - line_start) ** 2)
+
+    if np.any(valid):
+        # 计算点在线段上的投影比例
+        valid_vecs = line_vec[valid]
+        proj = np.zeros(np.sum(valid))
+        for i in range(len(proj)):
+            proj[i] = np.dot(point_vec, valid_vecs[i])
+        proj = proj / line_len_sq[valid]  # (N_valid,)
+        proj = np.clip(proj, 0.0, 1.0)
+
+        # 计算线段上的最近点
+        closest = np.zeros((np.sum(valid), 3))
+        for i in range(len(proj)):
+            closest[i] = line_start + proj[i] * valid_vecs[i]
+
+        # 计算最近点到目标点的距离平方
+        for i in range(len(proj)):
+            result[np.where(valid)[0][i]] = np.sum((closest[i] - point) ** 2)
+
+    return result
 
 def los_distance_sq_each_ray(M_t: np.ndarray, C_t: np.ndarray) -> np.ndarray:
     """返回 M_t->T_arr 每条线段到 C_t 的最小距离平方数组"""
@@ -404,6 +453,25 @@ class PSO:
         plt.savefig("pso_convergence_plot.png", dpi=300, bbox_inches='tight')
         plt.show()
 
+class Timeout:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.timer = None
+        self.timeout_occurred = False
+    
+    def timeout_function(self):
+        self.timeout_occurred = True
+        print(f"  [警告] 操作已超过{self.seconds}秒，标记为超时")
+    
+    def __enter__(self):
+        self.timer = threading.Timer(self.seconds, self.timeout_function)
+        self.timer.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.timer:
+            self.timer.cancel()
+
 class AcceleratedPSO:
     def __init__(self, swarm=60, iters=300, w0=0.9, w1=0.4, c1=1.8, c2=1.8, seed=42, 
                  n_jobs=-1, local_search_freq=10):
@@ -480,23 +548,62 @@ class AcceleratedPSO:
         self.best_hist = []
 
     def local_search(self, x_center, radius=0.1):
-        """在最优解附近进行局部搜索，提高精度"""
+        """在最优解附近进行局部搜索，提高精度（带超时保护）"""
+        print("  开始局部搜索...")
         best_x = x_center.copy()
         best_fit = covered_time_3bombs_fast(best_x)
         
         span = self.ub - self.lb
-        n_trials = 20  # 局部搜索次数
+        n_trials = 30  # 减少局部搜索次数 (从20减到10)
         
-        # 随机扰动搜索
-        for _ in range(n_trials):
-            x_new = x_center + self.rng.normal(0, radius, 8) * span
-            x_new = np.clip(x_new, self.lb, self.ub)
-            x_new[0] = angle_wrap(x_new[0])
-            
-            fit_new = covered_time_3bombs_fast(x_new)
-            if fit_new > best_fit:
-                best_fit = fit_new
-                best_x = x_new.copy()
+        try:
+            with Timeout(60):  # 30秒超时保护
+                # 维度扰动搜索 (更高效)
+                for dim in range(8):
+                    # 每个维度正负方向各尝试一点
+                    delta = span[dim] * radius * 0.1
+                    
+                    # 正向扰动
+                    point_pos = best_x.copy()
+                    point_pos[dim] += delta
+                    point_pos[dim] = min(self.ub[dim], point_pos[dim])
+                    if dim == 0:  # 角度特殊处理
+                        point_pos[dim] = angle_wrap(point_pos[dim])
+                    
+                    fit_pos = covered_time_3bombs_fast(point_pos)
+                    if fit_pos > best_fit:
+                        best_fit = fit_pos
+                        best_x = point_pos.copy()
+                    
+                    # 负向扰动
+                    point_neg = best_x.copy()
+                    point_neg[dim] -= delta
+                    point_neg[dim] = max(self.lb[dim], point_neg[dim])
+                    if dim == 0:  # 角度特殊处理
+                        point_neg[dim] = angle_wrap(point_neg[dim])
+                    
+                    fit_neg = covered_time_3bombs_fast(point_neg)
+                    if fit_neg > best_fit:
+                        best_fit = fit_neg
+                        best_x = point_neg.copy()
+                
+                # 再进行少量随机搜索
+                for _ in range(n_trials - 16):  # 剩余次数
+                    x_new = best_x + self.rng.normal(0, radius, 8) * span * 0.5
+                    x_new = np.clip(x_new, self.lb, self.ub)
+                    x_new[0] = angle_wrap(x_new[0])
+                    
+                    fit_new = covered_time_3bombs_fast(x_new)
+                    if fit_new > best_fit:
+                        best_fit = fit_new
+                        best_x = x_new.copy()
+        
+        except Exception as e:
+            print(f"  [警告] 局部搜索异常: {str(e)}")
+        
+        # 检查是否有改进
+        if best_fit > covered_time_3bombs_fast(x_center):
+            print(f"  [局部搜索] 发现更优解: {best_fit:.6f}s")
         
         return best_x, best_fit
 
@@ -548,15 +655,17 @@ class AcceleratedPSO:
             
             # 周期性局部搜索
             if it % self.local_search_freq == 0:
-                improved_x, improved_fit = self.local_search(
-                    self.gbest, 
-                    radius=0.1 * (1 - it/self.iters)  # 随迭代递减搜索半径
-                )
-                if improved_fit > self.gfit:
-                    self.gbest = improved_x.copy()
-                    self.gfit = improved_fit
-                    print(f"  [局部搜索] 发现更优解: {improved_fit:.6f}s")
-
+                try:
+                    improved_x, improved_fit = self.local_search(
+                        self.gbest, 
+                        radius=0.1 * (1 - it/self.iters)
+                    )
+                    if improved_fit > self.gfit:
+                        self.gbest = improved_x.copy()
+                        self.gfit = improved_fit
+                except Exception as e:
+                    print(f"  [警告] 局部搜索异常: {str(e)}")
+            
             # 打印与曲线
             print(f"[PSO {it}/{self.iters}] iter_best={iter_best:.6f}s, gbest={self.gfit:.6f}s")
             self.it_hist.append(it)
@@ -564,14 +673,17 @@ class AcceleratedPSO:
 
         # 最终局部精细搜索
         print("执行最终精细局部搜索...")
-        improved_x, improved_fit = self.local_search(self.gbest, radius=0.02)
-        if improved_fit > self.gfit:
-            self.gbest = improved_x
-            self.gfit = improved_fit
-            print(f"  [精细搜索] 最终优化: {improved_fit:.6f}s")
-            # 添加最后一个点
-            self.it_hist.append(self.it_hist[-1] + 1)
-            self.best_hist.append(self.gfit)
+        try:
+            improved_x, improved_fit = self.local_search(self.gbest, radius=0.02)
+            if improved_fit > self.gfit:
+                self.gbest = improved_x
+                self.gfit = improved_fit
+                print(f"  [精细搜索] 最终优化: {improved_fit:.6f}s")
+                # 添加最后一个点
+                self.it_hist.append(self.it_hist[-1] + 1)
+                self.best_hist.append(self.gfit)
+        except Exception as e:
+            print(f"  [警告] 最终局部搜索失败: {str(e)}")
         
         # 关闭进程池
         pool.close()
@@ -585,7 +697,7 @@ class AcceleratedPSO:
     def plot_convergence(self):
         """最终绘制完整收敛曲线"""
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.set_title(f"加速PSO收敛曲线：三弹联合遮蔽时间 ({self.n_jobs}核并行)", fontsize=14)
+        ax.set_title(f"加速PSO收敛曲线：三弹联合遮蔽时间", fontsize=14)
         ax.set_xlabel("迭代次数", fontsize=12)
         ax.set_ylabel("遮蔽时间 (s)", fontsize=12)
         ax.grid(True, linestyle=":", alpha=0.7)
@@ -636,7 +748,7 @@ def main():
     # 使用加速版PSO
     pso = AcceleratedPSO(
         swarm=60,             
-        iters=200,            
+        iters=250,
         w0=0.9, w1=0.4,       
         c1=1.8, c2=1.8,       
         seed=42,              
@@ -667,6 +779,154 @@ def main():
         "total_time": best_score
     }])
     df.to_excel("result1.xlsx", index=False)
+
+    # ===== 可视化三枚烟幕干扰弹的遮蔽区间 =====
+    visualize_3bombs_coverage(theta, vF, t_rel, dly, best_score)
+
+def visualize_3bombs_coverage(theta, vF, t_rels, delays, best_score):
+    """绘制三枚烟幕干扰弹的遮蔽区间可视化图"""
+    # 计算起爆时刻和结束时刻
+    t_dets = [t_rel + dly for t_rel, dly in zip(t_rels, delays)]
+    t_ends = [t_det + t_window for t_det in t_dets]
+    
+    # 整体时间范围
+    t_min = min(t_rels)
+    t_max = max(t_ends) + 1
+    
+    # 创建时间轴
+    ts = np.arange(0, t_max + 1, 0.02)  # 精细网格
+    
+    # 计算每个烟幕弹的遮蔽状态
+    covered_status = []
+    
+    for t in ts:
+        # 导弹位置
+        M_t = M0 + vM * t * uM
+        
+        # 无人机方向
+        uF = np.array([np.cos(theta), np.sin(theta), 0])
+        
+        status = []  # 三个烟幕弹各自的状态
+        
+        for i, (t_rel, dly) in enumerate(zip(t_rels, delays)):
+            t_det = t_rel + dly
+            
+            # 如果时间早于起爆或晚于有效期，则不遮蔽
+            if t < t_det or t > t_det + t_window:
+                status.append(0)
+                continue
+                
+            # 计算投放点
+            drop_pos = F0 + vF * t_rel * uF
+            
+            # 计算起爆点
+            drop_vel = vF * uF
+            bomb_pos = drop_pos + drop_vel * dly + np.array([0, 0, -0.5 * g * dly**2])
+            
+            # 计算云团中心
+            dt = t - t_det
+            cloud_center = bomb_pos + np.array([0, 0, -v_sink * dt])
+            
+            # 计算所有视线的遮蔽状态
+            dist_sq = point_to_line_segment_distance_sq_batch(cloud_center, M_t, cylinder_points)
+            status.append(1 if np.all(dist_sq <= r_cloud**2) else 0)
+        
+        # 记录每个烟幕弹的状态和联合状态
+        covered_status.append(status)
+    
+    covered_status = np.array(covered_status)  # shape: (len(ts), 3)
+    
+    # 联合遮蔽状态(至少有一个遮蔽)
+    joint_status = (covered_status.sum(axis=1) > 0).astype(float)
+    
+    # 创建可视化图
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    # 设置标题和标签
+    ax.set_title("三枚烟幕弹遮蔽时间轴 (含投放、起爆与有效区间标注)", fontsize=14)
+    ax.set_xlabel("时间 t (秒)", fontsize=12)
+    ax.set_ylabel("遮蔽状态 (1=遮蔽, 0=未遮蔽)", fontsize=12)
+    
+    # 绘制联合遮蔽状态线
+    ax.plot(ts, joint_status, '-', color='#1f77b4', linewidth=2, label="联合遮蔽")
+    
+    # 填充联合遮蔽区域
+    ax.fill_between(ts, 0, joint_status, where=(joint_status > 0.5), 
+                   alpha=0.3, color='#add8e6', interpolate=True)
+    
+    # 定义颜色
+    colors = ['#ff9966', '#ffcc99', '#ffdd99']  # 从深橙到浅橙的渐变
+    
+    # 为每个烟幕弹绘制遮蔽区间
+    for i in range(3):
+        # 对应烟幕弹的状态
+        bomb_status = covered_status[:, i]
+        
+        # 高度偏移量，使三个烟幕弹在图中可以分开显示
+        offset = 1.0 + 0.1 * (i+1)
+        
+        # 绘制起始状态线(为了图例)
+        ax.plot([0], [0], '-', color=colors[i], linewidth=10, alpha=0.7,
+               label=f"烟幕弹{i+1}有效区间")
+        
+        # 标记投放、起爆和结束时间点
+        ax.axvline(t_rels[i], linestyle='--', color='green', alpha=0.7)
+        ax.axvline(t_dets[i], linestyle='--', color='red', alpha=0.7)
+        ax.axvline(t_ends[i], linestyle='--', color='purple', alpha=0.7)
+        
+        # 添加文字标签
+        ax.text(t_rels[i], offset, f"投放{i+1}", color='green', 
+                ha='center', va='bottom', rotation=90, fontsize=9)
+        ax.text(t_dets[i], offset, f"起爆{i+1}", color='red', 
+                ha='center', va='bottom', rotation=90, fontsize=9)
+        
+        # 找出遮蔽区间
+        changes = np.diff(bomb_status)
+        start_idxs = np.where(changes > 0.5)[0]
+        end_idxs = np.where(changes < -0.5)[0]
+        
+        # 处理边界情况
+        if bomb_status[0] > 0.5:
+            start_idxs = np.insert(start_idxs, 0, -1)
+        if bomb_status[-1] > 0.5:
+            end_idxs = np.append(end_idxs, len(bomb_status)-1)
+        
+        # 绘制遮蔽区间
+        for start_i, end_i in zip(start_idxs, end_idxs):
+            start_t = ts[start_i+1] if start_i >= 0 else ts[0]
+            end_t = ts[end_i] if end_i < len(ts) else ts[-1]
+            
+            # 绘制区间
+            ax.axvspan(start_t, end_t, ymin=0.7, ymax=0.9 + 0.03*i, 
+                      alpha=0.7, color=colors[i], label=f'_nolegend_')
+            
+            # 区间时长
+            duration = end_t - start_t
+            if duration > 1.0:  # 只标注较长的区间
+                ax.text((start_t + end_t)/2, offset - 0.05, 
+                       f"遮蔽区间", ha='center', fontsize=8)
+    
+    # 标记图例
+    ax.plot([0], [0], '--', color='green', label="投放时刻")
+    ax.plot([0], [0], '--', color='red', label="起爆时刻")
+    ax.plot([0], [0], '--', color='purple', label="有效期结束")
+    
+    # 添加总遮蔽时长标注
+    ax.annotate(f"总联合遮蔽时长: {best_score:.3f} s", 
+               xy=(0.97, 0.03), xycoords='axes fraction',
+               ha='right', fontsize=12, bbox=dict(boxstyle="round,pad=0.3", 
+               fc="#FFD27F", alpha=0.3))
+    
+    # 调整图表格式
+    ax.grid(True, linestyle=':')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.set_ylim(-0.05, 1.25)
+    ax.set_xlim(0, t_max)
+    
+    # 保存与显示
+    plt.tight_layout()
+    plt.savefig("three_bombs_coverage.png", dpi=300, bbox_inches='tight')
+    plt.show()
 
 if __name__ == "__main__":
     main()
