@@ -15,8 +15,10 @@ mpl.rcParams['axes.unicode_minus'] = False
 
 # ===== 问题一参数配置 =====
 # 坐标系：假目标为原点(0,0,0)
-# 真目标代表点（下底面圆心）
-T = np.array([0.0, 200.0, 0.0], dtype=float)
+# 真目标圆柱体：半径7米，高度10米，中心轴从(0,200,0)到(0,200,10)
+T_center = np.array([0.0, 200.0, 5.0], dtype=float)  # 圆柱体中心点
+T_radius = 7.0  # 圆柱体半径(m)
+T_height = 10.0  # 圆柱体高度(m)
 
 # 来袭导弹 M1
 M0 = np.array([20000.0, 0.0, 2000.0], dtype=float)  # 初始位置
@@ -72,30 +74,101 @@ def cloud_center_position(t: float) -> np.ndarray:
     return det_pos + np.array([0, 0, -v_sink * dt])
 
 # ===== 几何计算函数 =====
-def los_distance_sq_to_cloud_center(t: float) -> float:
-    """计算导弹-真目标视线到云团中心的最小距离平方"""
+def point_to_line_segment_distance_sq(point, line_start, line_end):
+    """计算点到线段的最小距离平方"""
+    # 线段向量
+    line_vec = line_end - line_start
+    # 点到线段起点的向量
+    point_vec = point - line_start
+    # 线段长度的平方
+    line_len_sq = np.dot(line_vec, line_vec)
+    
+    # 如果线段长度为零，则直接计算点到点的距离
+    if line_len_sq < 1e-10:
+        return np.dot(point_vec, point_vec)
+    
+    # 计算投影比例
+    t = np.dot(point_vec, line_vec) / line_len_sq
+    t = max(0.0, min(1.0, t))  # 钳制到[0,1]区间
+    
+    # 计算投影点
+    projection = line_start + t * line_vec
+    
+    # 返回点到投影点的距离平方
+    return np.sum((point - projection)**2)
+
+def is_point_covered(t: float, target_point: np.ndarray) -> bool:
+    """检查特定目标点是否被遮蔽"""
     cloud_center = cloud_center_position(t)
     if any(np.isnan(cloud_center)):
-        return np.inf
+        return False
     
     # 导弹位置
     M_t = missile_position(t)
     
-    # 真目标位置T到导弹位置M_t的向量
-    TM = M_t - T
+    # 计算云团中心到导弹-目标点线段的最小距离平方
+    d2 = point_to_line_segment_distance_sq(cloud_center, M_t, target_point)
     
-    # 云团中心到真目标的向量
-    CT = cloud_center - T
+    # 检查是否在云团有效半径内
+    return d2 <= (r_cloud**2 + 1e-12)
+
+def generate_cylinder_points(num_points=100):
+    """在圆柱体表面生成均匀分布的点（不包括底面）"""
+    points = []
     
-    # 计算投影系数s
-    s = np.dot(CT, TM) / np.dot(TM, TM)
-    s_clamped = max(0.0, min(1.0, s))
+    # 圆柱体参数
+    z_min = T_center[2] - T_height/2
+    z_max = T_center[2] + T_height/2
     
-    # 计算线段上离云团最近的点
-    closest_point = T + s_clamped * TM
+    # 计算侧面和顶面的面积比例
+    area_side = 2 * np.pi * T_radius * T_height
+    area_top = np.pi * T_radius**2
+    total_area = area_side + area_top
     
-    # 返回距离平方
-    return np.sum((closest_point - cloud_center)**2)
+    # 分配点数
+    num_side = int(num_points * area_side / total_area)
+    num_top = num_points - num_side
+    
+    # 生成侧面点
+    num_z = max(2, int(np.sqrt(num_side / (2 * np.pi))))
+    num_theta = max(4, int(num_side / num_z))
+    
+    z_values = np.linspace(z_min, z_max, num_z)
+    theta_values = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
+    
+    for z in z_values:
+        for theta in theta_values:
+            x = T_center[0] + T_radius * np.cos(theta)
+            y = T_center[1] + T_radius * np.sin(theta)
+            points.append(np.array([x, y, z]))
+    
+    # 生成顶面点
+    num_r = max(1, int(np.sqrt(num_top)))
+    num_theta_top = max(4, int(num_top / num_r))
+    
+    r_values = np.linspace(0, T_radius, num_r)
+    theta_values_top = np.linspace(0, 2*np.pi, num_theta_top, endpoint=False)
+    
+    # 顶面
+    for r in r_values:
+        for theta in theta_values_top:
+            x = T_center[0] + r * np.cos(theta)
+            y = T_center[1] + r * np.sin(theta)
+            points.append(np.array([x, y, z_max]))
+    
+    return points[:num_points]  # 确保返回指定数量的点
+
+# 生成圆柱体表面点（不包括底面）
+cylinder_points = generate_cylinder_points(100)
+
+def is_target_covered(t: float) -> bool:
+    """检查整个圆柱体表面（不包括底面）是否被遮蔽"""
+    # 检查圆柱体表面每个点是否都被遮蔽
+    for point in cylinder_points:
+        if not is_point_covered(t, point):
+            return False
+    
+    return True
 
 # ===== 二分法求根 =====
 def bisection_root(f, a, b, tol=1e-6, max_iter=100):
@@ -124,23 +197,24 @@ def main():
     t_end = t_detonate + t_window
     
     # 时间采样点
-    num_points = 2000
+    num_points = 1000  # 减少采样点以提高性能
     ts = np.linspace(t_start, t_end, num_points)
     
-    # 定义距离函数
+    # 定义遮蔽函数
     def f_threshold(t):
-        return los_distance_sq_to_cloud_center(t) - r_cloud**2
+        return 1.0 if is_target_covered(t) else -1.0
     
-    # 计算各时间点的距离平方
-    d2_list = np.array([los_distance_sq_to_cloud_center(t) for t in ts], dtype=float)
-    covered = d2_list <= (r_cloud**2 + 1e-12)  # 容差判断
+    # 计算各时间点的遮蔽状态
+    covered = np.array([is_target_covered(t) for t in ts], dtype=bool)
     
     # 寻找遮蔽区间的边界
     boundaries = []
     if covered.any():
         for i in range(len(ts) - 1):
             if covered[i] != covered[i+1]:
-                root = bisection_root(f_threshold, ts[i], ts[i+1], tol=1e-10, max_iter=100)
+                # 使用二分法精确查找边界
+                root = bisection_root(lambda t: 1.0 if is_target_covered(t) else -1.0, 
+                                     ts[i], ts[i+1], tol=1e-10, max_iter=100)
                 boundaries.append(root)
         
         # 补齐端点
@@ -170,7 +244,7 @@ def main():
     
     # ===== 可视化 =====
     # 3D几何示意图
-    fig = plt.figure(figsize=(12, 9))
+    fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
     
     # 计算关键点轨迹
@@ -189,38 +263,86 @@ def main():
     ax.plot(cloud_traj[:,0], cloud_traj[:,1], cloud_traj[:,2], 
             'm-', linewidth=1.5, label='云团中心轨迹')
     
+    # 绘制圆柱体目标（不包括底面）
+    z_min = T_center[2] - T_height/2
+    z_max = T_center[2] + T_height/2
+    
+    # 绘制侧面
+    theta = np.linspace(0, 2 * np.pi, 100)
+    z = np.linspace(z_min, z_max, 10)
+    theta, z = np.meshgrid(theta, z)
+    x = T_center[0] + T_radius * np.cos(theta)
+    y = T_center[1] + T_radius * np.sin(theta)
+    ax.plot_surface(x, y, z, color='gray', alpha=0.3, label='圆柱体目标')
+    
+    # 绘制顶面
+    r = np.linspace(0, T_radius, 10)
+    theta = np.linspace(0, 2 * np.pi, 100)
+    r, theta = np.meshgrid(r, theta)
+    x = T_center[0] + r * np.cos(theta)
+    y = T_center[1] + r * np.sin(theta)
+    z_top = np.full_like(x, z_max)
+    ax.plot_surface(x, y, z_top, color='gray', alpha=0.3)
+    
+    # 绘制采样点（不包括底面）
+    points_array = np.array(cylinder_points)
+    ax.scatter(points_array[:,0], points_array[:,1], points_array[:,2], 
+               c='black', s=10, alpha=0.5, label='采样点')
+    
     # 标记关键点
     ax.scatter(*M0, c='red', s=60, label='导弹初始位置')
     ax.scatter(*F0, c='blue', s=60, label='无人机初始位置')
     ax.scatter(*bomb_position(t_release), c='green', s=60, label='干扰弹投放点')
-    ax.scatter(*bomb_position(t_detonate), c='magenta', s=80, marker='*', label='起爆点')
-    ax.scatter(*T, c='black', s=100, marker='X', label='真目标')
+    ax.scatter(*bomb_position(t_detonate), c='magenta', s=100, marker='*', label='起爆点')
+    
+    # 添加文字标注
+    ax.text(T_center[0], T_center[1], T_center[2], "圆柱体目标中心", fontsize=12, color='black', zorder=10)
     
     # 设置图形属性
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.set_title('烟幕干扰弹投放策略几何示意图')
-    ax.legend()
+    ax.set_xlabel('X (m)', fontsize=12)
+    ax.set_ylabel('Y (m)', fontsize=12)
+    ax.set_zlabel('Z (m)', fontsize=12)
+    ax.set_title('烟幕干扰弹投放策略几何示意图', fontsize=14)
+    ax.legend(fontsize=10)
     
-    # 距离-时间曲线
-    fig2 = plt.figure(figsize=(9, 5))
+    # 调整视角以便更好地观察圆柱体目标
+    ax.view_init(elev=25, azim=-45)  # 仰角25度，方位角-45度
+    
+    # 设置坐标轴范围
+    ax.set_xlim([-1000, 20000])
+    ax.set_ylim([-1000, 1000])
+    ax.set_zlim([-100, 2500])
+    
+    # 添加网格
+    ax.grid(True, linestyle=':', alpha=0.7)
+    
+    # 距离-时间曲线（改为遮蔽状态图）
+    fig2 = plt.figure(figsize=(10, 6))
     ax2 = fig2.add_subplot(111)
-    d_arr = np.sqrt(np.clip(d2_list, 0, np.inf))
-    mask_covered = (d_arr <= r_cloud) & np.isfinite(d_arr)
     
-    ax2.plot(ts, d_arr, linewidth=1.5, label="视线-云团中心最小距离 d(t)")
-    ax2.axhline(r_cloud, linestyle="--", linewidth=1.0, color='red', label="阈值 r=10 m")
+    # 计算遮蔽状态
+    covered_status = np.array([is_target_covered(t) for t in ts], dtype=float)
+    
+    # 绘制遮蔽状态
+    ax2.plot(ts, covered_status, 'b-', linewidth=1.5, label="遮蔽状态")
+    ax2.axhline(1.0, linestyle="--", linewidth=1.0, color='green', label="完全遮蔽")
+    ax2.axhline(0.0, linestyle="--", linewidth=1.0, color='red', label="未完全遮蔽")
     
     # 填充遮蔽区间
-    ax2.fill_between(ts, 0, d_arr, where=mask_covered, 
-                    alpha=0.2, color='green', label="遮蔽区间")
+    mask_covered = covered_status > 0.5
+    ax2.fill_between(ts, 0, covered_status, where=mask_covered, 
+                    alpha=0.2, color='green', label="完全遮蔽区间")
     
-    ax2.set_xlabel("时间 (s)")
-    ax2.set_ylabel("距离 (m)")
-    ax2.set_title("问题一: 视线-云团中心距离随时间的变化")
+    # 标记遮蔽区间
+    for i, (start, end) in enumerate(intervals):
+        ax2.axvspan(start, end, alpha=0.1, color='blue')
+        ax2.text((start+end)/2, 0.5, f"区间{i+1}", ha='center', fontsize=10)
+    
+    ax2.set_xlabel("时间 (s)", fontsize=12)
+    ax2.set_ylabel("遮蔽状态", fontsize=12)
+    ax2.set_title("问题一: 圆柱体目标遮蔽状态随时间变化", fontsize=14)
     ax2.grid(True, linestyle=":")
-    ax2.legend(loc="best")
+    ax2.legend(loc="best", fontsize=10)
     
     plt.tight_layout()
     plt.show()
