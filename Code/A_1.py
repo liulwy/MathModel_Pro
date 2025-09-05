@@ -273,15 +273,15 @@ def main():
     bomb_traj = np.array([bomb_position(t) for t in np.linspace(t_release, t_detonate, 50)])
     cloud_traj = np.array([cloud_center_position(t) for t in np.linspace(t_detonate, t_end, 50)])
     
-    # 绘制轨迹
-    ax.plot(missile_traj[:,0], missile_traj[:,1], missile_traj[:,2], 
-            'r-', linewidth=1.5, label='导弹轨迹')
-    ax.plot(drone_traj[:,0], drone_traj[:,1], drone_traj[:,2], 
-            'b-', linewidth=1.5, label='无人机轨迹')
-    ax.plot(bomb_traj[:,0], bomb_traj[:,1], bomb_traj[:,2], 
-            'g-', linewidth=1.5, label='干扰弹轨迹')
-    ax.plot(cloud_traj[:,0], cloud_traj[:,1], cloud_traj[:,2], 
-            'm-', linewidth=1.5, label='云团中心轨迹')
+    # 绘制轨迹（更新颜色与线型）
+    ax.plot(missile_traj[:,0], missile_traj[:,1], missile_traj[:,2],
+            color="#FF7F0E", linestyle="-", linewidth=1.8, label='导弹轨迹')         # 橙
+    ax.plot(drone_traj[:,0], drone_traj[:,1], drone_traj[:,2],
+            color="#17BECF", linestyle="-", linewidth=1.8, label='无人机轨迹')       # 青
+    ax.plot(bomb_traj[:,0], bomb_traj[:,1], bomb_traj[:,2],
+            color="#8C564B", linestyle="-.", linewidth=1.8, label='干扰弹轨迹')      # 棕（点划线）
+    ax.plot(cloud_traj[:,0], cloud_traj[:,1], cloud_traj[:,2],
+            color="#9467BD", linestyle="--", linewidth=1.8, label='云团中心轨迹')    # 紫（虚线）
     
     # 绘制圆柱体目标（不包括底面）
     z_min = T_center[2] - T_height/2
@@ -339,28 +339,28 @@ def main():
     # 距离-时间曲线（改为遮蔽状态图）
     fig2 = plt.figure(figsize=(10, 6))
     ax2 = fig2.add_subplot(111)
-    
+
     # 计算遮蔽状态
     covered_status = np.array([is_target_covered(t) for t in ts], dtype=float)
-    
-    # 绘制遮蔽状态
-    ax2.plot(ts, covered_status, 'b-', linewidth=1.5, label="遮蔽状态")
-    ax2.axhline(1.0, linestyle="--", linewidth=1.0, color='green', label="完全遮蔽")
-    ax2.axhline(0.0, linestyle="--", linewidth=1.0, color='red', label="未完全遮蔽")
-    
-    # 填充遮蔽区间
+
+    # 绘制遮蔽状态（更新颜色）
+    ax2.plot(ts, covered_status, color="#FF7F0E", linewidth=1.8, label="遮蔽状态")   # 橙
+    ax2.axhline(1.0, linestyle="--", linewidth=1.0, color="#9467BD", label="完全遮蔽")  # 紫
+    ax2.axhline(0.0, linestyle="--", linewidth=1.0, color="#8C564B", label="未完全遮蔽") # 棕
+
+    # 填充遮蔽区间（更新填充色）
     mask_covered = covered_status > 0.5
-    ax2.fill_between(ts, 0, covered_status, where=mask_covered, 
-                    alpha=0.2, color='green', label="完全遮蔽区间")
-    
-    # 标记遮蔽区间
+    ax2.fill_between(ts, 0, covered_status, where=mask_covered,
+                     alpha=0.25, color="#FFD27F", label="完全遮蔽区间")  # 浅橙
+
+    # 标记遮蔽区间（更新区间底色）
     for i, (start, end) in enumerate(intervals):
-        ax2.axvspan(start, end, alpha=0.1, color='blue')
-        ax2.text((start+end)/2, 0.5, f"区间{i+1}", ha='center', fontsize=10)
+        ax2.axvspan(start, end, alpha=0.15, color="#17BECF")  # 青色半透明
+        ax2.text((start+end)/2, 0.52, f"区间{i+1}", ha='center', fontsize=10, color="#333333")
     
     ax2.set_xlabel("时间 (s)", fontsize=12)
     ax2.set_ylabel("遮蔽状态", fontsize=12)
-    ax2.set_title("问题一: 圆柱体目标遮蔽状态随时间变化", fontsize=14)
+    ax2.set_title("圆柱体目标遮蔽状态随时间变化函数", fontsize=14)
     ax2.grid(True, linestyle=":")
     ax2.legend(loc="best", fontsize=10)
     
