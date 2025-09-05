@@ -161,14 +161,34 @@ def generate_cylinder_points(num_points=100):
 # 生成圆柱体表面点（不包括底面）
 cylinder_points = generate_cylinder_points(100)
 
+def los_distance_sq_each_ray(t: float) -> np.ndarray:
+    """返回导弹到圆柱体采样点集合的视线到云团中心的最小距离平方数组"""
+    C_t = cloud_center_position(t)
+    if np.isnan(C_t).any():
+        return np.full(len(cylinder_points), np.inf, dtype=float)
+
+    M_t = missile_position(t)
+    T_arr = np.asarray(cylinder_points, dtype=float)  # (N,3)
+
+    # 线段最近点向量化计算：对每个 T_i -- M_t
+    TM = M_t - T_arr                        # (N,3)
+    den = np.einsum('ij,ij->i', TM, TM)     # (N,)
+    CT = C_t - T_arr                        # (N,3)
+
+    s = np.zeros_like(den, dtype=float)
+    mask = den > 0.0
+    s[mask] = np.einsum('ij,ij->i', CT[mask], TM[mask]) / den[mask]
+    s = np.clip(s, 0.0, 1.0)
+
+    closest = T_arr + s[:, None] * TM       # (N,3)
+    diff = closest - C_t
+    d2 = np.einsum('ij,ij->i', diff, diff)  # (N,)
+    return d2
+
 def is_target_covered(t: float) -> bool:
-    """检查整个圆柱体表面（不包括底面）是否被遮蔽"""
-    # 检查圆柱体表面每个点是否都被遮蔽
-    for point in cylinder_points:
-        if not is_point_covered(t, point):
-            return False
-    
-    return True
+    """全覆盖判定：所有射线的最短距离均不超过 r_cloud 才算有效"""
+    d2_each = los_distance_sq_each_ray(t)
+    return bool(np.all(d2_each <= (r_cloud**2 + 1e-12)))
 
 # ===== 二分法求根 =====
 def bisection_root(f, a, b, tol=1e-6, max_iter=100):
