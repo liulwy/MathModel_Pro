@@ -95,7 +95,7 @@ def covered_time(t_rel, dly, vF, theta):
     )
     return float(np.sum(covered_flags) * DT)
 
-def refine(th, v, tr, dl, iters=300, step=(0.1, 1.0, 0.05, 0.05)):
+def refine(th, v, tr, dl, iters=240, step=(0.1, 1.0, 0.05, 0.05)):
     """
     在粗搜的较优解附近做随机邻域搜索并逐步缩小步长
     参数: th, v, tr, dl: 初始解(来自粗搜)
@@ -159,8 +159,8 @@ def main():
     t0 = time.time()
 
     # 参数范围
-    thetas = np.linspace(-np.pi, np.pi, 15)   # 航向角
-    vFs = np.linspace(70, 140, 10)            # 速度
+    thetas = np.linspace(-np.pi, np.pi, 150)   # 航向角
+    vFs = np.linspace(70, 140, 20)            # 速度
     t_rels = np.linspace(0, 10, 11)           # 投放时间
     dlays = np.linspace(0, 6, 7)              # 起爆延迟
 
@@ -176,7 +176,7 @@ def main():
                         best = (score, theta, vF, t_rel, dly)
 
     # 局部细化
-    best = refine(*best[1:], iters=240)
+    best = refine(*best[1:], iters=400)
 
     elapsed = time.time() - t0
 
