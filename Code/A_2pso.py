@@ -288,7 +288,7 @@ class AcceleratedPSO:
         self.iter_nums = []
     
     def _smart_initialize(self, n_particles):
-        """智能初始化粒子位置"""
+        """智能初始化粒子位置 (采用A_3pso的初始化策略)"""
         particles = np.zeros((n_particles, 4))
         
         # 20% 完全随机初始化
@@ -297,36 +297,41 @@ class AcceleratedPSO:
             for j in range(4):
                 particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
         
-        # 30% 使用预设好的航向角分布
-        num_preset = int(n_particles * 0.3)
+        # 40% 使用均匀分布的航向角和参数组合
+        num_preset = int(n_particles * 0.4)
         if num_preset > 0:
-            preset_angles = np.array([0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi, 
-                                     -np.pi/4, -np.pi/2, -3*np.pi/4])
+            # 均匀角度分布
+            angles = np.linspace(-np.pi, np.pi, num_preset, endpoint=False)
             for i in range(num_random, num_random + num_preset):
-                angle_idx = i % len(preset_angles)
-                particles[i, 0] = preset_angles[angle_idx] + np.random.normal(0, 0.1)
-                # 随机其他参数
-                for j in range(1, 4):
-                    particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
+                idx = i - num_random
+                particles[i, 0] = angles[idx] + np.random.normal(0, 0.05)
+                # 投放时间从较早开始
+                particles[i, 2] = np.random.uniform(0, 5)
+                # 速度在中等偏快范围
+                particles[i, 1] = np.random.uniform(80, 120)
+                # 延迟时间中等范围
+                particles[i, 3] = np.random.uniform(1, 4)
         
-        # 其余粒子随机初始化
+        # 其余粒子随机初始化但偏向小角度探索
         for i in range(num_random + num_preset, n_particles):
-            for j in range(4):
+            particles[i, 0] = np.random.normal(0, 0.5)  # 角度集中在0附近
+            for j in range(1, 4):
                 particles[i, j] = self.bounds[j, 0] + np.random.random() * (self.bounds[j, 1] - self.bounds[j, 0])
         
         return particles
     
     def get_dynamic_params(self, iter):
-        """获取动态参数"""
+        """获取动态参数(与A_3pso一致)"""
         progress = iter / self.max_iter
         w = self.w_init - (self.w_init - self.w_end) * progress
-        c1 = self.c1_init - (self.c1_init - self.c1_end) * progress
-        c2 = self.c2_init + (self.c2_end - self.c2_init) * progress
+        # 简化为使用恒定值
+        c1 = self.c1_init
+        c2 = self.c2_init
         return w, c1, c2
     
     # 替换原来的局部搜索函数
     def local_search(self):
-        """在全局最优附近进行局部搜索（Windows兼容版）"""
+        """在全局最优附近进行局部搜索（Windows兼容版，采用A_3pso的搜索策略）"""
         if self.gbest_val <= 0:
             return
         
@@ -337,17 +342,18 @@ class AcceleratedPSO:
         best_val = self.gbest_val
         best_pos = self.gbest_pos.copy()
         
-        # 局部搜索范围
+        # 局部搜索范围随迭代减小(与A_3pso一致)
         prog = len(self.history) / self.max_iter
         scale = 0.2 * (1 - prog) + 0.02
         
         # 准备搜索点
         search_points = []
         
-        # 对每个维度单独扰动
+        # 对每个维度单独扰动(与A_3pso一致)
+        span = self.bounds[:,1] - self.bounds[:,0]
         for dim in range(4):
-            local_range = self.bounds[dim, 1] - self.bounds[dim, 0]
-            delta = local_range * scale * 0.1
+            # 每个维度正负方向各尝试一点
+            delta = span[dim] * scale * 0.1
             
             # 正向扰动
             point_pos = best_pos.copy()
@@ -363,7 +369,8 @@ class AcceleratedPSO:
         
         # 再增加几个随机点
         for _ in range(n_local - 8):
-            point = best_pos + np.random.normal(0, 1, 4) * scale * 0.05
+            # 随机扰动幅度更小(与A_3pso一致)
+            point = best_pos + np.random.normal(0, 1, 4) * scale * 0.05 * span
             # 边界处理
             for j in range(4):
                 point[j] = max(self.bounds[j, 0], min(self.bounds[j, 1], point[j]))
@@ -522,15 +529,15 @@ class AcceleratedPSO:
 def main():
     t0 = time.time()
     
-    # 使用加速版PSO
+    # 使用A_3pso中的优化参数
     pso = AcceleratedPSO(
-        n_particles=60,              # 粒子数量
-        max_iter=200,                # 迭代次数
-        w_init=0.9, w_end=0.4,       # 惯性权重
-        c1_init=2.5, c1_end=0.5,     # 认知系数
-        c2_init=0.5, c2_end=2.5,     # 社会系数
+        n_particles=60,              # 从A_3pso.py中采用(原来也是60)
+        max_iter=250,                # 从200增加到250(与A_3pso.py一致)
+        w_init=0.9, w_end=0.4,       # 保持不变(与A_3pso.py一致)
+        c1_init=1.8, c1_end=1.8,     # 简化为恒定值1.8(与A_3pso.py一致)
+        c2_init=1.8, c2_end=1.8,     # 简化为恒定值1.8(与A_3pso.py一致)
         n_jobs=-1,                   # 使用所有可用核心
-        local_search_freq=10         # 每10次迭代进行局部搜索
+        local_search_freq=10         # 每10次迭代进行局部搜索(与A_3pso.py一致)
     )
     
     best_params, best_score = pso.optimize()
@@ -557,13 +564,13 @@ def main():
     print(f"优化用时: {elapsed:.2f} s")
     
     # 可视化最优解
-    visualize_solution(theta_opt, vF_opt, t_rel_opt, dly_opt, drop_point, bomb_pos)
+    visualize_solution(theta_opt, vF_opt, t_rel_opt, dly_opt, drop_point, bomb_pos, best_score)
     
     # 保存结果
     save_results(best_params, best_score, drop_point, bomb_pos)
 
 # ===== 可视化函数 =====
-def visualize_solution(theta, vF, t_rel, dly, drop_point, bomb_pos):
+def visualize_solution(theta, vF, t_rel, dly, drop_point, bomb_pos, best_score):
     """可视化最优解下的遮蔽效果（简化版）"""
     # 计算关键参数
     t_det = t_rel + dly
@@ -645,11 +652,11 @@ def visualize_solution(theta, vF, t_rel, dly, drop_point, bomb_pos):
     
     # 在图中添加关键参数信息
     info_text = (
-        f"航向角: {np.degrees(theta):.2f}°\n"
-        f"飞行速度: {vF:.2f} m/s\n"
-        f"投放时刻: {t_rel:.2f} s\n"
-        f"起爆延迟: {dly:.2f} s\n"
-        f"总遮蔽时长: {total_covered:.3f} s"
+        f"航向角: {np.degrees(theta):.4f}°\n"
+        f"飞行速度: {vF:.4f} m/s\n"
+        f"投放时刻: {t_rel:.4f} s\n"
+        f"起爆延迟: {dly:.4f} s\n"
+        f"总遮蔽时长: {best_score:.4f} s"  # 使用优化算法给出的确切值
     )
     ax.text(0.02, 0.02, info_text, transform=ax.transAxes, fontsize=10,
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))

@@ -336,6 +336,129 @@ def covered_time_3bombs_fast(x: np.ndarray) -> float:
     
     return float(total_time)
 
+# 添加一个计算单个烟幕弹遮蔽时长的函数
+def calculate_single_bomb_coverage(theta, vF, t_rel, dly):
+    """计算单个烟幕弹的有效遮蔽时长"""
+    t_det = t_rel + dly
+    t_end = t_det + t_window
+    
+    # 时间轴
+    ts = np.arange(t_det, t_end, DT)
+    if len(ts) == 0:
+        return 0.0
+    
+    # 无人机方向向量
+    uF = np.array([np.cos(theta), np.sin(theta), 0.0])
+    
+    # 投放点
+    drop_pos = F0 + vF * t_rel * uF
+    
+    # 计算起爆点
+    dt_to_det = dly
+    bomb_pos = drop_pos + vF * uF * dt_to_det + np.array([0.0, 0.0, -0.5 * g * dt_to_det**2])
+    
+    # 计算每个时刻的遮蔽状态
+    covered = []
+    for t in ts:
+        Mt = M0 + vM * t * uM  # 导弹位置
+        
+        # 云团中心位置
+        dt_from_det = t - t_det
+        cloud_center = bomb_pos + np.array([0.0, 0.0, -v_sink * dt_from_det])
+        
+        # 计算遮蔽状态
+        d2_each = los_distance_sq_each_ray(Mt, cloud_center)
+        if np.all(d2_each <= _thr2):
+            covered.append(1)
+        else:
+            covered.append(0)
+    
+    # 计算遮蔽时长
+    return float(sum(covered)) * DT
+
+def covered_time_3bombs_v2(x: np.ndarray) -> float:
+    """
+    三弹联合遮蔽时长计算 - 版本2：逐个计算每枚烟幕弹的遮蔽时长
+    """
+    theta = np.clip(x[0], -np.pi, np.pi)
+    vF = np.clip(x[1], 70.0, 140.0)
+    t1 = np.clip(x[2], 0.0, 10.0)
+    d1 = np.clip(x[3], 0.0, 6.0)
+    gap2 = max(0.0, np.clip(x[4], 0.0, 6.0))
+    d2 = np.clip(x[5], 0.0, 6.0)
+    gap3 = max(0.0, np.clip(x[6], 0.0, 6.0))
+    d3 = np.clip(x[7], 0.0, 6.0)
+
+    t2 = t1 + 1.0 + gap2
+    t3 = t2 + 1.0 + gap3
+    
+    # 计算每枚烟幕弹的遮蔽时长
+    coverage_1 = calculate_single_bomb_coverage(theta, vF, t1, d1)
+    coverage_2 = calculate_single_bomb_coverage(theta, vF, t2, d2)
+    coverage_3 = calculate_single_bomb_coverage(theta, vF, t3, d3)
+    
+    # 返回三枚烟幕弹遮蔽时长的最小值（联合遮蔽判据）
+    return min(coverage_1, coverage_2, coverage_3)
+
+def covered_time_3bombs_v3(x: np.ndarray) -> float:
+    """
+    三弹联合遮蔽时长计算 - 版本3：逐个计算每枚烟幕弹的遮蔽时长（优化版）
+    """
+    theta = np.clip(x[0], -np.pi, np.pi)
+    vF = np.clip(x[1], 70.0, 140.0)
+    t1 = np.clip(x[2], 0.0, 10.0)
+    d1 = np.clip(x[3], 0.0, 6.0)
+    gap2 = max(0.0, np.clip(x[4], 0.0, 6.0))
+    d2 = np.clip(x[5], 0.0, 6.0)
+    gap3 = max(0.0, np.clip(x[6], 0.0, 6.0))
+    d3 = np.clip(x[7], 0.0, 6.0)
+
+    t2 = t1 + 1.0 + gap2
+    t3 = t2 + 1.0 + gap3
+    
+    total_coverage = 0.0
+    
+    # 逐个计算每枚烟幕弹的遮蔽时长
+    for t_rel, dly in zip([t1, t2, t3], [d1, d2, d3]):
+        t_det = t_rel + dly
+        t_end = t_det + t_window
+        
+        # 时间轴
+        ts = np.arange(t_det, t_end, DT)
+        if len(ts) == 0:
+            continue
+        
+        # 无人机方向向量
+        uF = np.array([np.cos(theta), np.sin(theta), 0.0])
+        
+        # 投放点
+        drop_pos = F0 + vF * t_rel * uF
+        
+        # 计算起爆点
+        dt_to_det = dly
+        bomb_pos = drop_pos + vF * uF * dt_to_det + np.array([0.0, 0.0, -0.5 * g * dt_to_det**2])
+        
+        # 计算每个时刻的遮蔽状态
+        covered = []
+        for t in ts:
+            Mt = M0 + vM * t * uM  # 导弹位置
+            
+            # 云团中心位置
+            dt_from_det = t - t_det
+            cloud_center = bomb_pos + np.array([0.0, 0.0, -v_sink * dt_from_det])
+            
+            # 计算遮蔽状态
+            d2_each = los_distance_sq_each_ray(Mt, cloud_center)
+            if np.all(d2_each <= _thr2):
+                covered.append(1)
+            else:
+                covered.append(0)
+        
+        # 累加有效遮蔽时长
+        total_coverage += float(sum(covered)) * DT
+    
+    return total_coverage
+
 def _eval_particle(x):
     """粒子评估函数(用于并行处理)"""
     return covered_time_3bombs_fast(x)
@@ -742,59 +865,129 @@ def decode_solution(x):
     dets = [t1 + d1, t2 + d2, t3 + d3]
     return theta, vF, [t1, t2, t3], [d1, d2, d3], dets
 
-def main():
-    t0 = time.time()
+def save_to_excel(theta, vF, t_rels, delays, t_dets, best_score, single_coverage_times, filename=None):
+    """将结果保存到Excel文件"""
+    import os
+    import pandas as pd
+    import openpyxl
     
-    # 使用加速版PSO
-    pso = AcceleratedPSO(
-        swarm=60,             
-        iters=250,
-        w0=0.9, w1=0.4,       
-        c1=1.8, c2=1.8,       
-        seed=42,              
-        n_jobs=-1,             
-        local_search_freq=10   
-    )
+    # 使用绝对路径
+    if filename is None:
+        # 获取项目根目录的绝对路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(current_dir)  # 上一级目录
+        filename = os.path.join(project_dir, "src", "result1.xlsx")
     
-    best_score, best_x = pso.optimize()  # 使用新的优化方法
-    theta, vF, t_rel, dly, t_det = decode_solution(best_x)
-    elapsed = time.time() - t0
+    print(f"尝试写入文件: {os.path.abspath(filename)}")
+    
+    # 计算各弹参数
+    drop_points = []
+    det_points = []
+    uF = np.array([np.cos(theta), np.sin(theta), 0.0])
+    
+    for i in range(3):
+        t_rel = t_rels[i]
+        t_det = t_dets[i]
+        
+        # 投放点
+        drop_pos = F0 + vF * t_rel * uF
+        drop_points.append(drop_pos)
+        
+        # 起爆点
+        dt = t_det - t_rel
+        det_pos = drop_pos + vF * uF * dt + np.array([0.0, 0.0, -0.5 * g * dt**2])
+        det_points.append(det_pos)
+    
+    try:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+        
+        # 准备数据行
+        data = []
+        for i in range(3):
+            data.append({
+                "无人机运动方向(度)": round(np.degrees(theta), 2),
+                "无人机运动速度(m/s)": round(vF, 2),
+                "烟幕干扰弹编号": i+1,
+                "投放点x坐标(m)": round(drop_points[i][0], 2),
+                "投放点y坐标(m)": round(drop_points[i][1], 2),
+                "投放点z坐标(m)": round(drop_points[i][2], 2),
+                "起爆点x坐标(m)": round(det_points[i][0], 2),
+                "起爆点y坐标(m)": round(det_points[i][1], 2),
+                "起爆点z坐标(m)": round(det_points[i][2], 2),
+                "有效干扰时长(s)": round(single_coverage_times[i], 2)
+            })
+        
+        # 方法1：简单粗暴地创建新的Excel
+        df = pd.DataFrame(data)
+        df.to_excel(filename, index=False)
+        print(f"已成功保存结果到 {filename}（方法1）")
+        
+    except Exception as e:
+        print(f"保存Excel出错: {str(e)}")
+        print(f"错误类型: {e.__class__.__name__}")
+        
+        try:
+            # 方法2：尝试更直接的方式
+            print("尝试方法2：直接使用openpyxl...")
+            
+            # 创建新的工作簿
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            
+            # 添加表头
+            headers = ["无人机运动方向(度)", "无人机运动速度(m/s)", "烟幕干扰弹编号", 
+                       "投放点x坐标(m)", "投放点y坐标(m)", "投放点z坐标(m)", 
+                       "起爆点x坐标(m)", "起爆点y坐标(m)", "起爆点z坐标(m)", 
+                       "有效干扰时长(s)"]
+            
+            for col, header in enumerate(headers, 1):
+                ws.cell(row=1, column=col, value=header)
+            
+            # 填充数据
+            for i in range(3):
+                row = i + 2
+                ws.cell(row=row, column=1, value=round(np.degrees(theta), 2))
+                ws.cell(row=row, column=2, value=round(vF, 2))
+                ws.cell(row=row, column=3, value=i+1)
+                ws.cell(row=row, column=4, value=round(drop_points[i][0], 2))
+                ws.cell(row=row, column=5, value=round(drop_points[i][1], 2))
+                ws.cell(row=row, column=6, value=round(drop_points[i][2], 2))
+                ws.cell(row=row, column=7, value=round(det_points[i][0], 2))
+                ws.cell(row=row, column=8, value=round(det_points[i][1], 2))
+                ws.cell(row=row, column=9, value=round(det_points[i][2], 2))
+                ws.cell(row=row, column=10, value=round(single_coverage_times[i], 2))
+            
+            # 保存
+            wb.save(filename)
+            print(f"已成功保存结果到 {filename}（方法2）")
+            
+        except Exception as e2:
+            print(f"备选方法也失败: {str(e2)}")
+            print(f"错误类型: {e2.__class__.__name__}")
+            
+            # 最后尝试保存到当前目录
+            try:
+                print("尝试保存到当前目录...")
+                local_filename = "result1.xlsx"
+                df = pd.DataFrame(data)
+                df.to_excel(local_filename, index=False)
+                print(f"已保存结果到当前目录: {os.path.abspath(local_filename)}")
+            except Exception as e3:
+                print(f"所有保存方法均失败: {str(e3)}")
 
-    print("最优结果")
-    print(f"theta: {np.degrees(theta):.4f}°")
-    print(f"vF: {vF:.4f} m/s")
-    print(f"t_rel: {t_rel}")
-    print(f"dly:   {dly}")
-    print(f"t_det: {t_det}")
-    print(f"总遮蔽时长(联合): {best_score:.6f} s")
-    print(f"用时: {elapsed:.2f} s")
-
-    # 保存到 result1.xlsx（问题三要求）
-    df = pd.DataFrame([{
-        "theta_deg": np.degrees(theta),
-        "vF": vF,
-        "t_rel1": t_rel[0], "delay1": dly[0], "t_det1": t_det[0],
-        "t_rel2": t_rel[1], "delay2": dly[1], "t_det2": t_det[1],
-        "t_rel3": t_rel[2], "delay3": dly[2], "t_det3": t_det[2],
-        "total_time": best_score
-    }])
-    df.to_excel("result1.xlsx", index=False)
-
-    # ===== 可视化三枚烟幕干扰弹的遮蔽区间 =====
-    visualize_3bombs_coverage(theta, vF, t_rel, dly, best_score)
-
-def visualize_3bombs_coverage(theta, vF, t_rels, delays, best_score):
-    """绘制三枚烟幕干扰弹的遮蔽区间可视化图"""
+def visualize_3bombs_coverage(theta, vF, t_rels, delays, best_score, single_coverage_times):
+    """绘制三枚烟幕弹的遮蔽区间可视化，包括单独遮蔽时长"""
     # 计算起爆时刻和结束时刻
     t_dets = [t_rel + dly for t_rel, dly in zip(t_rels, delays)]
     t_ends = [t_det + t_window for t_det in t_dets]
     
     # 整体时间范围
-    t_min = min(t_rels)
+    t_min = min(t_rels) - 1
     t_max = max(t_ends) + 1
     
     # 创建时间轴
-    ts = np.arange(0, t_max + 1, 0.02)  # 精细网格
+    ts = np.arange(t_min, t_max, 0.02)  # 精细网格
     
     # 计算每个烟幕弹的遮蔽状态
     covered_status = []
@@ -840,93 +1033,142 @@ def visualize_3bombs_coverage(theta, vF, t_rels, delays, best_score):
     joint_status = (covered_status.sum(axis=1) > 0).astype(float)
     
     # 创建可视化图
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     # 设置标题和标签
-    ax.set_title("三枚烟幕弹遮蔽时间轴 (含投放、起爆与有效区间标注)", fontsize=14)
+    ax.set_title("三枚烟幕弹遮蔽时间轴", fontsize=14)
     ax.set_xlabel("时间 t (秒)", fontsize=12)
-    ax.set_ylabel("遮蔽状态 (1=遮蔽, 0=未遮蔽)", fontsize=12)
+    ax.set_ylabel("遮蔽状态", fontsize=12)
     
     # 绘制联合遮蔽状态线
     ax.plot(ts, joint_status, '-', color='#1f77b4', linewidth=2, label="联合遮蔽")
     
     # 填充联合遮蔽区域
     ax.fill_between(ts, 0, joint_status, where=(joint_status > 0.5), 
-                   alpha=0.3, color='#add8e6', interpolate=True)
+                   alpha=0.3, color='#add8e6', label="_nolabel_")
     
     # 定义颜色
     colors = ['#ff9966', '#ffcc99', '#ffdd99']  # 从深橙到浅橙的渐变
+    labels = ['烟幕弹1有效区间', '烟幕弹2有效区间', '烟幕弹3有效区间']
     
     # 为每个烟幕弹绘制遮蔽区间
     for i in range(3):
-        # 对应烟幕弹的状态
-        bomb_status = covered_status[:, i]
+        t_det = t_dets[i]
+        t_end = t_ends[i]
         
-        # 高度偏移量，使三个烟幕弹在图中可以分开显示
-        offset = 1.0 + 0.1 * (i+1)
+        # 绘制有效区间
+        ax.axvspan(t_det, t_end, ymin=0.65+i*0.1, ymax=0.75+i*0.1, 
+                  alpha=0.7, color=colors[i], label=labels[i])
         
-        # 绘制起始状态线(为了图例)
-        ax.plot([0], [0], '-', color=colors[i], linewidth=10, alpha=0.7,
-               label=f"烟幕弹{i+1}有效区间")
+        # 标记投放和起爆时刻
+        ax.axvline(t_rels[i], linestyle='--', color='green', alpha=0.5, 
+                  label="投放时刻" if i==0 else "_nolabel_")
+        ax.axvline(t_det, linestyle='--', color='red', alpha=0.5,
+                  label="起爆时刻" if i==0 else "_nolabel_")
         
-        # 标记投放、起爆和结束时间点
-        ax.axvline(t_rels[i], linestyle='--', color='green', alpha=0.7)
-        ax.axvline(t_dets[i], linestyle='--', color='red', alpha=0.7)
-        ax.axvline(t_ends[i], linestyle='--', color='purple', alpha=0.7)
+        # 添加标签
+        ax.text(t_rels[i], 0.8+i*0.05, f"投{i+1}", color='green', ha='center', 
+               fontsize=9, rotation=90)
+        ax.text(t_det, 0.8+i*0.05, f"爆{i+1}", color='red', ha='center', 
+               fontsize=9, rotation=90)
         
-        # 添加文字标签
-        ax.text(t_rels[i], offset, f"投放{i+1}", color='green', 
-                ha='center', va='bottom', rotation=90, fontsize=9)
-        ax.text(t_dets[i], offset, f"起爆{i+1}", color='red', 
-                ha='center', va='bottom', rotation=90, fontsize=9)
-        
-        # 找出遮蔽区间
-        changes = np.diff(bomb_status)
-        start_idxs = np.where(changes > 0.5)[0]
-        end_idxs = np.where(changes < -0.5)[0]
-        
-        # 处理边界情况
-        if bomb_status[0] > 0.5:
-            start_idxs = np.insert(start_idxs, 0, -1)
-        if bomb_status[-1] > 0.5:
-            end_idxs = np.append(end_idxs, len(bomb_status)-1)
-        
-        # 绘制遮蔽区间
-        for start_i, end_i in zip(start_idxs, end_idxs):
-            start_t = ts[start_i+1] if start_i >= 0 else ts[0]
-            end_t = ts[end_i] if end_i < len(ts) else ts[-1]
-            
-            # 绘制区间
-            ax.axvspan(start_t, end_t, ymin=0.7, ymax=0.9 + 0.03*i, 
-                      alpha=0.7, color=colors[i], label=f'_nolegend_')
-            
-            # 区间时长
-            duration = end_t - start_t
-            if duration > 1.0:  # 只标注较长的区间
-                ax.text((start_t + end_t)/2, offset - 0.05, 
-                       f"遮蔽区间", ha='center', fontsize=8)
-    
-    # 标记图例
-    ax.plot([0], [0], '--', color='green', label="投放时刻")
-    ax.plot([0], [0], '--', color='red', label="起爆时刻")
-    ax.plot([0], [0], '--', color='purple', label="有效期结束")
-    
-    # 添加总遮蔽时长标注
-    ax.annotate(f"总联合遮蔽时长: {best_score:.3f} s", 
-               xy=(0.97, 0.03), xycoords='axes fraction',
-               ha='right', fontsize=12, bbox=dict(boxstyle="round,pad=0.3", 
-               fc="#FFD27F", alpha=0.3))
+        # 添加单独遮蔽时长标注
+        ax.text(t_ends[i] - 5, 0.7+i*0.1, 
+               f"遮蔽时长: {single_coverage_times[i]:.2f}s", 
+               ha='right', fontsize=8, color='#333333',
+               bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2'))
     
     # 调整图表格式
     ax.grid(True, linestyle=':')
     ax.legend(loc='upper right', fontsize=10)
-    ax.set_ylim(-0.05, 1.25)
-    ax.set_xlim(0, t_max)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlim(t_min, t_max)
     
-    # 保存与显示
+    # 添加关键参数标注
+    info_text = (
+        f"航向角: {np.degrees(theta):.2f}°\n"
+        f"飞行速度: {vF:.2f} m/s\n"
+        f"总遮蔽时长: {best_score:.3f} s"
+    )
+    ax.text(0.02, 0.02, info_text, transform=ax.transAxes, fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
     plt.tight_layout()
     plt.savefig("three_bombs_coverage.png", dpi=300, bbox_inches='tight')
     plt.show()
+
+def main():
+    t0 = time.time()
+    
+    # 使用加速版PSO
+    pso = AcceleratedPSO(
+        swarm=60,             
+        iters=250,
+        w0=0.9, w1=0.4,       
+        c1=1.8, c2=1.8,       
+        seed=42,              
+        n_jobs=-1,             
+        local_search_freq=10   
+    )
+    
+    best_score, best_x = pso.optimize()
+    theta, vF, t_rels, delays, t_dets = decode_solution(best_x)
+    elapsed = time.time() - t0
+
+    # 计算每颗弹的投放点和起爆点
+    drop_points = []
+    det_points = []
+    uF = np.array([np.cos(theta), np.sin(theta), 0.0])
+    
+    for i in range(3):
+        t_rel = t_rels[i]
+        t_det = t_dets[i]
+        
+        # 计算投放点
+        drop_pos = F0 + vF * t_rel * uF
+        drop_points.append(drop_pos)
+        
+        # 计算起爆点
+        dt = t_det - t_rel
+        det_pos = drop_pos + vF * uF * dt + np.array([0.0, 0.0, -0.5 * g * dt**2])
+        det_points.append(det_pos)
+    
+    # 计算每颗烟幕弹的单独遮蔽时长
+    single_coverage_times = []
+    print("计算各烟幕弹单独遮蔽时长...")
+    for i in range(3):
+        coverage_time = calculate_single_bomb_coverage(theta, vF, t_rels[i], delays[i])
+        single_coverage_times.append(coverage_time)
+        print(f"  烟幕弹#{i+1}单独遮蔽时长: {coverage_time:.4f} s")
+
+    # 增强的输出格式
+    print("\n" + "="*60)
+    print("优化结果摘要".center(60))
+    print("="*60)
+    print(f"总遮蔽时长(三弹并集): {best_score:.6f} s")
+    print(f"优化用时: {elapsed:.2f} s")
+    print("-"*60)
+    print(f"无人机参数:")
+    print(f"  运动方向: {np.degrees(theta):.4f}°")
+    print(f"  运动速度: {vF:.4f} m/s")
+    print("-"*60)
+    
+    # 三颗弹的详细信息
+    for i in range(3):
+        print(f"烟幕干扰弹 #{i+1}:")
+        print(f"  投放时刻: {t_rels[i]:.4f} s")
+        print(f"  延迟时间: {delays[i]:.4f} s")
+        print(f"  起爆时刻: {t_dets[i]:.4f} s")
+        print(f"  投放点坐标: ({drop_points[i][0]:.4f}, {drop_points[i][1]:.4f}, {drop_points[i][2]:.4f}) m")
+        print(f"  起爆点坐标: ({det_points[i][0]:.4f}, {det_points[i][1]:.4f}, {det_points[i][2]:.4f}) m")
+        print(f"  实际遮蔽时长: {single_coverage_times[i]:.4f} s")
+        print("-"*60)
+    
+    # 保存到Excel，使用新的详细函数
+    save_to_excel(theta, vF, t_rels, delays, t_dets, best_score, single_coverage_times)
+    
+    # 可视化三枚烟幕干扰弹的遮蔽区间
+    visualize_3bombs_coverage(theta, vF, t_rels, delays, best_score, single_coverage_times)
 
 if __name__ == "__main__":
     main()
